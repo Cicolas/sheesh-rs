@@ -57,4 +57,16 @@ impl Theme {
     pub fn dimmed() -> Style {
         Style::default().fg(Color::DarkGray)
     }
+
+    pub fn chat_user() -> Style {
+        Style::default().fg(Color::Green)
+    }
+
+    pub fn md_code_block() -> Style {
+        Style::default().fg(Color::Yellow)
+    }
+
+    pub fn md_code_inline() -> Style {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    }
 }

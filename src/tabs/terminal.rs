@@ -4,15 +4,13 @@ use std::{
     thread,
 };
 
-use crossterm::event::{
-    Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind,
-};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use log::info;
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Paragraph},
 };
@@ -27,8 +25,239 @@ const MAX_LINES: usize = 2000;
 /// A (line_index, col) position in the line buffer.
 type BufPos = (usize, usize);
 
+/// A text segment with an associated color style.
+#[derive(Clone, Debug)]
+struct StyledSpan {
+    text: String,
+    style: Style,
+}
+
+/// ANSI SGR state — carried across line boundaries.
+#[derive(Clone, Debug, Default)]
+struct AnsiState {
+    fg: Option<Color>,
+    bg: Option<Color>,
+    modifiers: Modifier,
+}
+
+impl AnsiState {
+    fn to_style(&self) -> Style {
+        let mut s = Style::default();
+        if let Some(fg) = self.fg {
+            s = s.fg(fg);
+        }
+        if let Some(bg) = self.bg {
+            s = s.bg(bg);
+        }
+        if !self.modifiers.is_empty() {
+            s = s.add_modifier(self.modifiers);
+        }
+        s
+    }
+}
+
+/// Parse a string that may contain ANSI escape codes into styled spans.
+/// Only SGR color codes (30-37, 38, 39, 40-47, 48, 49, 90-97, 100-107) are
+/// honoured; all other escape sequences are silently dropped.
+/// `state` is updated in-place so colors persist across line boundaries.
+fn parse_ansi(input: &str, state: &mut AnsiState) -> Vec<StyledSpan> {
+    let mut spans: Vec<StyledSpan> = Vec::new();
+    let mut text = String::new();
+    let mut chars = input.chars().peekable();
+
+    // Flush accumulated text into spans, merging with previous if same style.
+    macro_rules! flush {
+        () => {
+            if !text.is_empty() {
+                let style = state.to_style();
+                if spans
+                    .last()
+                    .map(|s: &StyledSpan| s.style == style)
+                    .unwrap_or(false)
+                {
+                    spans.last_mut().unwrap().text.push_str(&text);
+                } else {
+                    spans.push(StyledSpan {
+                        text: std::mem::take(&mut text),
+                        style,
+                    });
+                }
+                text.clear();
+            }
+        };
+    }
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\x1b' => match chars.peek() {
+                // CSI sequence: \x1b[ <params> <final>
+                Some('[') => {
+                    chars.next();
+                    let mut params = String::new();
+                    let mut final_byte = '\0';
+                    for c in chars.by_ref() {
+                        if c.is_ascii_alphabetic() {
+                            final_byte = c;
+                            break;
+                        }
+                        params.push(c);
+                    }
+                    if final_byte == 'm' {
+                        flush!();
+                        apply_sgr(&params, state);
+                    }
+                    // all other CSI sequences (cursor movement, etc.) are dropped
+                }
+                // OSC sequence: \x1b] ... BEL or ST
+                Some(']') => {
+                    chars.next();
+                    loop {
+                        match chars.next() {
+                            Some('\x07') | None => break,
+                            Some('\x1b') => {
+                                if chars.peek() == Some(&'\\') {
+                                    chars.next();
+                                }
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {
+                    chars.next();
+                }
+            },
+            '\r' => {}
+            '\x08' => {
+                text.pop();
+            }
+            c if c.is_control() && c != '\t' => {}
+            c => text.push(c),
+        }
+    }
+
+    flush!();
+    spans
+}
+
+/// Apply a semicolon-separated list of SGR codes to `state`.
+/// Only color-related codes are handled.
+fn apply_sgr(params: &str, state: &mut AnsiState) {
+    if params.is_empty() || params == "0" {
+        *state = AnsiState::default();
+        return;
+    }
+
+    let codes: Vec<u8> = params.split(';').filter_map(|s| s.parse().ok()).collect();
+
+    let mut i = 0;
+    while i < codes.len() {
+        match codes[i] {
+            0 => *state = AnsiState::default(),
+
+            // Text styling
+            1 => state.modifiers |= Modifier::BOLD,
+            2 => state.modifiers |= Modifier::DIM,
+            3 => state.modifiers |= Modifier::ITALIC,
+            4 => state.modifiers |= Modifier::UNDERLINED,
+            5 | 6 => state.modifiers |= Modifier::SLOW_BLINK,
+            7 => state.modifiers |= Modifier::REVERSED,
+            8 => state.modifiers |= Modifier::HIDDEN,
+            9 => state.modifiers |= Modifier::CROSSED_OUT,
+            22 => state.modifiers &= !(Modifier::BOLD | Modifier::DIM),
+            23 => state.modifiers &= !Modifier::ITALIC,
+            24 => state.modifiers &= !Modifier::UNDERLINED,
+            25 => state.modifiers &= !Modifier::SLOW_BLINK,
+            27 => state.modifiers &= !Modifier::REVERSED,
+            28 => state.modifiers &= !Modifier::HIDDEN,
+            29 => state.modifiers &= !Modifier::CROSSED_OUT,
+
+            // Standard foreground colors
+            30 => state.fg = Some(Color::Black),
+            31 => state.fg = Some(Color::Red),
+            32 => state.fg = Some(Color::Green),
+            33 => state.fg = Some(Color::Yellow),
+            34 => state.fg = Some(Color::Blue),
+            35 => state.fg = Some(Color::Magenta),
+            36 => state.fg = Some(Color::Cyan),
+            37 => state.fg = Some(Color::White),
+            38 => {
+                if i + 1 < codes.len() {
+                    match codes[i + 1] {
+                        5 if i + 2 < codes.len() => {
+                            state.fg = Some(Color::Indexed(codes[i + 2]));
+                            i += 2;
+                        }
+                        2 if i + 4 < codes.len() => {
+                            state.fg = Some(Color::Rgb(codes[i + 2], codes[i + 3], codes[i + 4]));
+                            i += 4;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            39 => state.fg = None,
+
+            // Standard background colors
+            40 => state.bg = Some(Color::Black),
+            41 => state.bg = Some(Color::Red),
+            42 => state.bg = Some(Color::Green),
+            43 => state.bg = Some(Color::Yellow),
+            44 => state.bg = Some(Color::Blue),
+            45 => state.bg = Some(Color::Magenta),
+            46 => state.bg = Some(Color::Cyan),
+            47 => state.bg = Some(Color::White),
+            48 => {
+                if i + 1 < codes.len() {
+                    match codes[i + 1] {
+                        5 if i + 2 < codes.len() => {
+                            state.bg = Some(Color::Indexed(codes[i + 2]));
+                            i += 2;
+                        }
+                        2 if i + 4 < codes.len() => {
+                            state.bg = Some(Color::Rgb(codes[i + 2], codes[i + 3], codes[i + 4]));
+                            i += 4;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            49 => state.bg = None,
+
+            // Bright foreground colors
+            90 => state.fg = Some(Color::DarkGray),
+            91 => state.fg = Some(Color::LightRed),
+            92 => state.fg = Some(Color::LightGreen),
+            93 => state.fg = Some(Color::LightYellow),
+            94 => state.fg = Some(Color::LightBlue),
+            95 => state.fg = Some(Color::LightMagenta),
+            96 => state.fg = Some(Color::LightCyan),
+            97 => state.fg = Some(Color::Gray),
+
+            // Bright background colors
+            100 => state.bg = Some(Color::DarkGray),
+            101 => state.bg = Some(Color::LightRed),
+            102 => state.bg = Some(Color::LightGreen),
+            103 => state.bg = Some(Color::LightYellow),
+            104 => state.bg = Some(Color::LightBlue),
+            105 => state.bg = Some(Color::LightMagenta),
+            106 => state.bg = Some(Color::LightCyan),
+            107 => state.bg = Some(Color::Gray),
+
+            _ => {}
+        }
+        i += 1;
+    }
+}
+
+/// Extract plain text from a styled line (used for LLM context and clipboard).
+fn plain_text(line: &[StyledSpan]) -> String {
+    line.iter().map(|s| s.text.as_str()).collect()
+}
+
 pub struct TerminalTab {
-    lines: Arc<Mutex<Vec<String>>>,
+    lines: Arc<Mutex<Vec<Vec<StyledSpan>>>>,
     pty_writer: Option<Box<dyn Write + Send>>,
     alive: Arc<Mutex<bool>>,
     /// Set to true by clear_buffer(); reader thread resets its partial on next tick.
@@ -67,7 +296,7 @@ impl TerminalTab {
         let master_writer = pair.master.take_writer()?;
         let mut master_reader = pair.master.try_clone_reader()?;
 
-        let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
+        let lines: Arc<Mutex<Vec<Vec<StyledSpan>>>> = Arc::new(Mutex::new(vec![]));
         let alive: Arc<Mutex<bool>> = Arc::new(Mutex::new(true));
         let clear_signal: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
 
@@ -78,18 +307,20 @@ impl TerminalTab {
         thread::spawn(move || {
             let mut buf = [0u8; 8192];
             let mut partial = String::new();
-            // Whether the last entry in `lines` is an unfinished partial line.
             let mut partial_in_buf = false;
+            // ANSI color state — persists across line boundaries for the session.
+            let mut ansi_state = AnsiState::default();
+
             loop {
                 match master_reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        // If the main thread requested a clear, discard our partial too.
                         {
                             let mut sig = clear_clone.lock().unwrap();
                             if *sig {
                                 partial.clear();
                                 partial_in_buf = false;
+                                ansi_state = AnsiState::default();
                                 *sig = false;
                             }
                         }
@@ -98,21 +329,26 @@ impl TerminalTab {
                         let chunk = String::from_utf8_lossy(&buf[..n]);
                         partial.push_str(&chunk);
 
-                        // Drain complete lines outside the lock.
-                        let mut complete: Vec<String> = Vec::new();
+                        // Extract complete lines, advancing ansi_state through each.
+                        let mut complete: Vec<Vec<StyledSpan>> = Vec::new();
                         while let Some(pos) = partial.find('\n') {
-                            complete.push(strip_ansi(&partial[..pos]));
+                            complete.push(parse_ansi(&partial[..pos], &mut ansi_state));
                             partial.drain(..=pos);
                         }
 
+                        // Parse the remaining partial with a clone so ansi_state only
+                        // advances through complete lines.
+                        let partial_line = {
+                            let mut tmp = ansi_state.clone();
+                            parse_ansi(&partial, &mut tmp)
+                        };
+
                         let mut lock = lines_clone.lock().unwrap();
-                        // Remove the previous partial line before re-adding.
                         if partial_in_buf && !lock.is_empty() {
                             lock.pop();
                         }
                         lock.extend(complete);
-                        // Always push the current partial so prompts show immediately.
-                        lock.push(strip_ansi(&partial));
+                        lock.push(partial_line);
                         partial_in_buf = true;
 
                         let len = lock.len();
@@ -147,7 +383,11 @@ impl TerminalTab {
     pub fn visible_text(&self, last_n: usize) -> String {
         let lock = self.lines.lock().unwrap();
         let start = lock.len().saturating_sub(last_n);
-        lock[start..].join("\n")
+        lock[start..]
+            .iter()
+            .map(|l| plain_text(l))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn send_bytes(&mut self, bytes: &[u8]) {
@@ -168,32 +408,59 @@ impl TerminalTab {
     /// Convert a screen (col, row) into a buffer (line_index, col).
     fn screen_to_buf(&self, col: u16, row: u16) -> Option<BufPos> {
         let inner = self.last_inner;
-        if row < inner.y || row >= inner.y + inner.height { return None; }
-        if col < inner.x { return None; }
+        if row < inner.y || row >= inner.y + inner.height {
+            return None;
+        }
+        if col < inner.x {
+            return None;
+        }
         let buf_line = self.last_render_start + (row - inner.y) as usize;
-        let buf_col  = (col - inner.x) as usize;
+        let buf_col = (col - inner.x) as usize;
         Some((buf_line, buf_col))
     }
 
     /// Normalise selection so (start <= end) in reading order.
     fn selection_range(&self) -> Option<(BufPos, BufPos)> {
         let (a, b) = self.selection?;
-        if a.0 < b.0 || (a.0 == b.0 && a.1 <= b.1) { Some((a, b)) } else { Some((b, a)) }
+        if a.0 < b.0 || (a.0 == b.0 && a.1 <= b.1) {
+            Some((a, b))
+        } else {
+            Some((b, a))
+        }
     }
 
     /// Extract the selected text from the line buffer.
     fn selected_text(&self) -> Option<String> {
         let (start, end) = self.selection_range()?;
         let lock = self.lines.lock().unwrap();
-        if start.0 >= lock.len() { return None; }
+        if start.0 >= lock.len() {
+            return None;
+        }
         let end_line = end.0.min(lock.len() - 1);
         let mut out = String::new();
         for li in start.0..=end_line {
-            let line = &lock[li];
-            let from = if li == start.0 { start.1.min(line.len()) } else { 0 };
-            let to   = if li == end_line { end.1.min(line.len()) } else { line.len() };
-            out.push_str(&line[from..to]);
-            if li < end_line { out.push('\n'); }
+            let text = plain_text(&lock[li]);
+            let from = if li == start.0 {
+                start.1.min(text.len())
+            } else {
+                0
+            };
+            let to = if li == end_line {
+                end.1.min(text.len())
+            } else {
+                text.len()
+            };
+            let from = (0..=from)
+                .rev()
+                .find(|&i| text.is_char_boundary(i))
+                .unwrap_or(0);
+            let to = (to..=text.len())
+                .find(|&i| text.is_char_boundary(i))
+                .unwrap_or(text.len());
+            out.push_str(&text[from..to]);
+            if li < end_line {
+                out.push('\n');
+            }
         }
         if out.is_empty() { None } else { Some(out) }
     }
@@ -237,8 +504,10 @@ impl Tab for TerminalTab {
 
     fn handle_event(&mut self, event: &Event) -> Action {
         match event {
-            Event::Key(KeyEvent { code, modifiers, .. }) => {
-                let ctrl  = modifiers.contains(KeyModifiers::CONTROL);
+            Event::Key(KeyEvent {
+                code, modifiers, ..
+            }) => {
+                let ctrl = modifiers.contains(KeyModifiers::CONTROL);
                 let shift = modifiers.contains(KeyModifiers::SHIFT);
 
                 match code {
@@ -270,8 +539,14 @@ impl Tab for TerminalTab {
                     }
 
                     // Scroll (Ctrl+Up/Down to not conflict with PTY arrow keys)
-                    KeyCode::Up if ctrl => { self.scroll_up(); return Action::None; }
-                    KeyCode::Down if ctrl => { self.scroll_down(); return Action::None; }
+                    KeyCode::Up if ctrl => {
+                        self.scroll_up();
+                        return Action::None;
+                    }
+                    KeyCode::Down if ctrl => {
+                        self.scroll_down();
+                        return Action::None;
+                    }
 
                     // ── Everything else goes straight to the PTY ────────────
                     KeyCode::Char(ch) => {
@@ -284,14 +559,14 @@ impl Tab for TerminalTab {
                             self.send_bytes(encoded.as_bytes());
                         }
                     }
-                    KeyCode::Enter     => self.send_bytes(b"\r"),
+                    KeyCode::Enter => self.send_bytes(b"\r"),
                     KeyCode::Backspace => self.send_bytes(b"\x7f"),
-                    KeyCode::Tab       => self.send_bytes(b"\t"),
-                    KeyCode::Esc       => self.send_bytes(b"\x1b"),
-                    KeyCode::Left      => self.send_bytes(b"\x1b[D"),
-                    KeyCode::Right     => self.send_bytes(b"\x1b[C"),
-                    KeyCode::Up        => self.send_bytes(b"\x1b[A"),
-                    KeyCode::Down      => self.send_bytes(b"\x1b[B"),
+                    KeyCode::Tab => self.send_bytes(b"\t"),
+                    KeyCode::Esc => self.send_bytes(b"\x1b"),
+                    KeyCode::Left => self.send_bytes(b"\x1b[D"),
+                    KeyCode::Right => self.send_bytes(b"\x1b[C"),
+                    KeyCode::Up => self.send_bytes(b"\x1b[A"),
+                    KeyCode::Down => self.send_bytes(b"\x1b[B"),
                     _ => {}
                 }
                 Action::None
@@ -301,10 +576,8 @@ impl Tab for TerminalTab {
             Event::Mouse(me) => {
                 match me.kind {
                     MouseEventKind::Down(MouseButton::Left) => {
-                        // Start a new selection; clear old one
-                        self.selection = self
-                            .screen_to_buf(me.column, me.row)
-                            .map(|pos| (pos, pos));
+                        self.selection =
+                            self.screen_to_buf(me.column, me.row).map(|pos| (pos, pos));
                     }
                     MouseEventKind::Drag(MouseButton::Left) => {
                         if let Some((anchor, _)) = self.selection {
@@ -314,13 +587,13 @@ impl Tab for TerminalTab {
                         }
                     }
                     MouseEventKind::Up(MouseButton::Left) => {
-                        // If anchor == cursor the user just clicked — clear selection
                         if let Some((a, b)) = self.selection {
-                            if a == b { self.selection = None; }
+                            if a == b {
+                                self.selection = None;
+                            }
                         }
                     }
-                    // Scroll wheel
-                    MouseEventKind::ScrollUp   => self.scroll_up(),
+                    MouseEventKind::ScrollUp => self.scroll_up(),
                     MouseEventKind::ScrollDown => self.scroll_down(),
                     _ => {}
                 }
@@ -355,7 +628,6 @@ impl Tab for TerminalTab {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        // Save for mouse coord translation.
         self.last_inner = inner;
 
         let visible_height = inner.height as usize;
@@ -384,82 +656,73 @@ impl Tab for TerminalTab {
     }
 }
 
-/// Render a single line, highlighting the portion that falls inside `sel`.
-fn render_line(line: &str, buf_line: usize, sel: Option<(BufPos, BufPos)>) -> Line<'static> {
+/// Render a single styled line, overlaying the selection highlight where applicable.
+fn render_line(
+    spans: &[StyledSpan],
+    buf_line: usize,
+    sel: Option<(BufPos, BufPos)>,
+) -> Line<'static> {
     let sel_style = Style::default().bg(Color::White).fg(Color::Black);
 
-    let Some((start, end)) = sel else {
-        return Line::from(Span::raw(line.to_string()));
+    // Determine byte-offset selection range for this line.
+    let sel_range: Option<(usize, usize)> = sel.and_then(|(s, e)| {
+        if buf_line < s.0 || buf_line > e.0 {
+            return None;
+        }
+        let total: usize = spans.iter().map(|sp| sp.text.len()).sum();
+        let from = if buf_line == s.0 { s.1.min(total) } else { 0 };
+        let to = if buf_line == e.0 {
+            e.1.min(total)
+        } else {
+            total
+        };
+        if from < to { Some((from, to)) } else { None }
+    });
+
+    let Some((sel_from, sel_to)) = sel_range else {
+        return Line::from(
+            spans
+                .iter()
+                .filter(|s| !s.text.is_empty())
+                .map(|s| Span::styled(s.text.clone(), s.style))
+                .collect::<Vec<_>>(),
+        );
     };
 
-    if buf_line < start.0 || buf_line > end.0 {
-        return Line::from(Span::raw(line.to_string()));
-    }
+    let mut result: Vec<Span<'static>> = Vec::new();
+    let mut pos = 0usize;
 
-    let len = line.len();
-    let from = if buf_line == start.0 { start.1.min(len) } else { 0 };
-    let to   = if buf_line == end.0   { end.1.min(len)   } else { len };
+    for span in spans {
+        let text = &span.text;
+        let len = text.len();
+        let span_end = pos + len;
 
-    if from >= to {
-        return Line::from(Span::raw(line.to_string()));
-    }
-
-    let mut spans = vec![];
-    if from > 0         { spans.push(Span::raw(line[..from].to_string())); }
-    spans.push(Span::styled(line[from..to].to_string(), sel_style));
-    if to < len         { spans.push(Span::raw(line[to..].to_string())); }
-    Line::from(spans)
-}
-
-fn strip_ansi(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '\x1b' => {
-                match chars.peek() {
-                    // CSI: \x1b[ ... <letter>
-                    Some('[') => {
-                        chars.next();
-                        for c in chars.by_ref() {
-                            if c.is_ascii_alphabetic() {
-                                break;
-                            }
-                        }
-                    }
-                    // OSC: \x1b] ... \x07  or  \x1b] ... \x1b\
-                    // This carries terminal title, hyperlinks, etc. — never visible text.
-                    Some(']') => {
-                        chars.next();
-                        loop {
-                            match chars.next() {
-                                // BEL terminates OSC
-                                Some('\x07') | None => break,
-                                // ESC \ (ST) terminates OSC
-                                Some('\x1b') => {
-                                    if chars.peek() == Some(&'\\') {
-                                        chars.next();
-                                    }
-                                    break;
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    // Any other \x1b sequence: skip the next char only
-                    _ => {
-                        chars.next();
-                    }
-                }
+        if sel_to <= pos || sel_from >= span_end {
+            if !text.is_empty() {
+                result.push(Span::styled(text.clone(), span.style));
             }
-            // Carriage return: skip (we split on \n; \r\n endings leave stray \r)
-            '\r' => {}
-            // Backspace: erase previous character (shell sends \x08 \x08 to visually delete)
-            '\x08' => { out.pop(); }
-            // Other non-printable control chars: skip
-            c if c.is_control() && c != '\t' => {}
-            c => out.push(c),
+        } else {
+            let a = sel_from.saturating_sub(pos).min(len);
+            let b = sel_to.saturating_sub(pos).min(len);
+            // Clamp to valid UTF-8 char boundaries.
+            let a = (0..=a)
+                .rev()
+                .find(|&i| text.is_char_boundary(i))
+                .unwrap_or(0);
+            let b = (b..=len).find(|&i| text.is_char_boundary(i)).unwrap_or(len);
+            if a > 0 {
+                result.push(Span::styled(text[..a].to_string(), span.style));
+            }
+            if a < b {
+                result.push(Span::styled(text[a..b].to_string(), sel_style));
+            }
+            if b < len {
+                result.push(Span::styled(text[b..].to_string(), span.style));
+            }
         }
+
+        pos += len;
     }
-    out
+
+    Line::from(result)
 }
