@@ -27,6 +27,8 @@ pub enum Action {
     SendContext,
     /// Disconnect from current SSH session
     Disconnect,
+    /// Send a command string to the terminal PTY (no trailing newline).
+    SendToTerminal(String),
     /// Toggle the help overlay
     Help,
     /// A raw input character (for text fields / terminal passthrough)

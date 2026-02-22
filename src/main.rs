@@ -194,6 +194,15 @@ impl Sheesh {
                 match action {
                     Action::Quit => return false,
                     Action::Disconnect => self.disconnect(),
+                    Action::SendToTerminal(cmd) => {
+                        if let Some(t) = &mut self.terminal {
+                            t.send_string(&cmd);
+                            t.send_string("\r");
+                        }
+                        if let AppState::Connected { ref mut focus, .. } = self.state {
+                            *focus = ConnectedFocus::Terminal;
+                        }
+                    }
                     _ => {}
                 }
             }

@@ -390,6 +390,12 @@ impl TerminalTab {
             .join("\n")
     }
 
+    /// Write a string into the PTY without appending a newline.
+    /// The user can review the command and press Enter themselves.
+    pub fn send_string(&mut self, s: &str) {
+        self.send_bytes(s.as_bytes());
+    }
+
     fn send_bytes(&mut self, bytes: &[u8]) {
         if let Some(ref mut w) = self.pty_writer {
             let _ = w.write_all(bytes);

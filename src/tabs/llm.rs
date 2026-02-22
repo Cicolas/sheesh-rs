@@ -36,6 +36,10 @@ pub struct LLMTab {
     input_scroll: usize,
     /// Saved from last render to hit-test mouse events against the input box.
     last_input_area: Rect,
+    /// Code blocks extracted from the latest assistant reply.
+    suggestions: Vec<String>,
+    /// Which suggestion is currently selected (None = no suggestions / cleared).
+    suggestion_idx: Option<usize>,
     clipboard: Option<arboard::Clipboard>,
 }
 
@@ -56,6 +60,8 @@ impl LLMTab {
             last_chat_area: Rect::default(),
             input_scroll: 0,
             last_input_area: Rect::default(),
+            suggestions: vec![],
+            suggestion_idx: None,
             clipboard: arboard::Clipboard::new().ok(),
         }
     }
@@ -67,6 +73,12 @@ impl LLMTab {
             match event {
                 LLMEvent::Response(text) => {
                     self.status = "Response received.".into();
+                    self.suggestions = extract_code_blocks(&text);
+                    self.suggestion_idx = if self.suggestions.is_empty() {
+                        None
+                    } else {
+                        Some(0)
+                    };
                     self.history.push(Message::assistant(text));
                     // Auto-scroll to bottom on new response
                     self.scroll_offset = 0;
@@ -230,12 +242,17 @@ impl Tab for LLMTab {
     }
 
     fn key_hints(&self) -> Vec<(&str, &str)> {
-        vec![
+        let mut hints = vec![
             ("enter", "send"),
             ("alt+enter", "newline"),
             ("esc", "clear input"),
             ("ctrl+c", "copy selection"),
-        ]
+        ];
+        if self.suggestion_idx.is_some() {
+            hints.push(("tab", "cycle suggestion"));
+            hints.push(("F4", "apply to terminal"));
+        }
+        hints
     }
 
     fn handle_event(&mut self, event: &Event) -> Action {
@@ -261,6 +278,30 @@ impl Tab for LLMTab {
                 }
                 if ctrl && *code == KeyCode::Down {
                     self.scroll_down();
+                    return Action::None;
+                }
+
+                // Suggestion cycling and application
+                if *code == KeyCode::Tab && !self.suggestions.is_empty() {
+                    let n = self.suggestions.len();
+                    self.suggestion_idx = Some(
+                        (self.suggestion_idx.unwrap_or(0) + 1) % n,
+                    );
+                    return Action::None;
+                }
+                if *code == KeyCode::BackTab && !self.suggestions.is_empty() {
+                    let n = self.suggestions.len();
+                    self.suggestion_idx = Some(
+                        (self.suggestion_idx.unwrap_or(0) + n - 1) % n,
+                    );
+                    return Action::None;
+                }
+                if *code == KeyCode::F(4) {
+                    if let Some(idx) = self.suggestion_idx {
+                        if let Some(cmd) = self.suggestions.get(idx) {
+                            return Action::SendToTerminal(cmd.clone());
+                        }
+                    }
                     return Action::None;
                 }
 
@@ -374,18 +415,26 @@ impl Tab for LLMTab {
         let input_width = inner.width.saturating_sub(2) as usize;
         let content_rows = wrapped_line_count(&self.input, input_width).clamp(1, 5);
         let input_height = content_rows as u16 + 2;
+        let suggestion_height = if self.suggestion_idx.is_some() { 1u16 } else { 0 };
 
-        let [chat_area, status_area, input_area] = Layout::vertical([
+        let areas = Layout::vertical([
             Constraint::Min(1),
             Constraint::Length(1),
+            Constraint::Length(suggestion_height),
             Constraint::Length(input_height),
         ])
-        .areas(inner);
+        .split(inner);
+
+        let (chat_area, status_area, suggestion_area, input_area) =
+            (areas[0], areas[1], areas[2], areas[3]);
 
         self.last_chat_area = chat_area;
         self.last_input_area = input_area;
         self.render_history(frame, chat_area);
         self.render_status(frame, status_area);
+        if suggestion_height > 0 {
+            self.render_suggestion(frame, suggestion_area);
+        }
         self.render_input(frame, input_area, focused);
     }
 }
@@ -469,6 +518,28 @@ impl LLMTab {
         frame.render_widget(Paragraph::new(visible).wrap(Wrap { trim: false }), area);
     }
 
+    fn render_suggestion(&self, frame: &mut Frame, area: Rect) {
+        let Some(idx) = self.suggestion_idx else {
+            return;
+        };
+        let Some(cmd) = self.suggestions.get(idx) else {
+            return;
+        };
+        let total = self.suggestions.len();
+        // Show first line of the command; truncate with … if it has more.
+        let first_line = cmd.lines().next().unwrap_or("").to_string();
+        let preview = if cmd.lines().count() > 1 {
+            format!("{} …", first_line)
+        } else {
+            first_line
+        };
+        let line = Line::from(vec![
+            Span::styled(format!(" ⟩ [{}/{}] ", idx + 1, total), Theme::key_hint_key()),
+            Span::styled(preview, Theme::md_code_inline()),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+    }
+
     fn render_status(&self, frame: &mut Frame, area: Rect) {
         let style = if self.waiting {
             Theme::dimmed()
@@ -509,6 +580,33 @@ impl LLMTab {
 
         frame.render_widget(para, area);
     }
+}
+
+// ── Suggestion helpers ────────────────────────────────────────────────────────
+
+/// Extract all fenced code block contents from an LLM response text.
+fn extract_code_blocks(text: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut in_block = false;
+    let mut current = String::new();
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            if in_block {
+                let trimmed = current.trim().to_string();
+                if !trimmed.is_empty() {
+                    blocks.push(trimmed);
+                }
+                current.clear();
+                in_block = false;
+            } else {
+                in_block = true; // skip the fence line itself
+            }
+        } else if in_block {
+            current.push_str(line);
+            current.push('\n');
+        }
+    }
+    blocks
 }
 
 // ── Input helpers ─────────────────────────────────────────────────────────────
