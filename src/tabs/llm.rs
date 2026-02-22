@@ -32,6 +32,10 @@ pub struct LLMTab {
     selection: Option<(BufPos, BufPos)>,
     last_render_start: usize,
     last_chat_area: Rect,
+    /// Rows scrolled up inside the input box (0 = cursor visible at bottom).
+    input_scroll: usize,
+    /// Saved from last render to hit-test mouse events against the input box.
+    last_input_area: Rect,
     clipboard: Option<arboard::Clipboard>,
 }
 
@@ -50,6 +54,8 @@ impl LLMTab {
             selection: None,
             last_render_start: 0,
             last_chat_area: Rect::default(),
+            input_scroll: 0,
+            last_input_area: Rect::default(),
             clipboard: arboard::Clipboard::new().ok(),
         }
     }
@@ -204,6 +210,11 @@ impl LLMTab {
         if out.is_empty() { None } else { Some(out) }
     }
 
+    fn is_over_input(&self, col: u16, row: u16) -> bool {
+        let a = self.last_input_area;
+        col >= a.x && col < a.x + a.width && row >= a.y && row < a.y + a.height
+    }
+
     fn copy_selection(&mut self) {
         if let Some(text) = self.selected_text() {
             if let Some(ref mut cb) = self.clipboard {
@@ -258,21 +269,26 @@ impl Tab for LLMTab {
                     KeyCode::Enter => {
                         if modifiers.contains(KeyModifiers::ALT) {
                             self.input.push('\n');
+                            self.input_scroll = 0;
                         } else {
                             let msg = std::mem::take(&mut self.input);
+                            self.input_scroll = 0;
                             self.send_message(msg);
                         }
                     }
                     KeyCode::Esc => {
                         self.input.clear();
+                        self.input_scroll = 0;
                     }
                     KeyCode::Backspace => {
                         self.input.pop();
+                        self.input_scroll = 0;
                     }
                     KeyCode::Char(ch)
                         if modifiers.is_empty() || modifiers.contains(KeyModifiers::SHIFT) =>
                     {
                         self.input.push(*ch);
+                        self.input_scroll = 0;
                     }
                     _ => {}
                 }
@@ -280,6 +296,7 @@ impl Tab for LLMTab {
             }
 
             Event::Mouse(me) => {
+                let over_input = self.is_over_input(me.column, me.row);
                 match me.kind {
                     MouseEventKind::Down(MouseButton::Left) => {
                         self.selection =
@@ -299,8 +316,20 @@ impl Tab for LLMTab {
                             }
                         }
                     }
-                    MouseEventKind::ScrollUp => self.scroll_up(),
-                    MouseEventKind::ScrollDown => self.scroll_down(),
+                    MouseEventKind::ScrollUp => {
+                        if over_input {
+                            self.input_scroll += 1;
+                        } else {
+                            self.scroll_up();
+                        }
+                    }
+                    MouseEventKind::ScrollDown => {
+                        if over_input {
+                            self.input_scroll = self.input_scroll.saturating_sub(1);
+                        } else {
+                            self.scroll_down();
+                        }
+                    }
                     _ => {}
                 }
                 Action::None
@@ -340,19 +369,11 @@ impl Tab for LLMTab {
         let inner = outer_block.inner(area);
         frame.render_widget(outer_block, area);
 
-        // Input grows with content (1–5 content lines + 2 border rows).
-        // Count both explicit newlines and wrapped lines.
+        // Input height: 1–5 content rows + 2 border = 3–7 total.
+        // Grows with content; scrolls internally once it hits the cap.
         let input_width = inner.width.saturating_sub(2) as usize;
-        let content_lines: usize = if input_width == 0 {
-            1
-        } else {
-            self.input
-                .split('\n')
-                .map(|l| ((l.len() + 1) + input_width - 1) / input_width)
-                .sum::<usize>()
-                .max(1)
-        };
-        let input_height = (content_lines + 2).min(7) as u16;
+        let content_rows = wrapped_line_count(&self.input, input_width).clamp(1, 5);
+        let input_height = content_rows as u16 + 2;
 
         let [chat_area, status_area, input_area] = Layout::vertical([
             Constraint::Min(1),
@@ -362,6 +383,7 @@ impl Tab for LLMTab {
         .areas(inner);
 
         self.last_chat_area = chat_area;
+        self.last_input_area = input_area;
         self.render_history(frame, chat_area);
         self.render_status(frame, status_area);
         self.render_input(frame, input_area, focused);
@@ -413,8 +435,16 @@ impl LLMTab {
 
                 // Selection overlay — fall back to plain rendering for this line.
                 let len = text.len();
-                let from = if li == sel_start.0 { sel_start.1.min(len) } else { 0 };
-                let to   = if li == sel_end.0   { sel_end.1.min(len)   } else { len };
+                let from = if li == sel_start.0 {
+                    sel_start.1.min(len)
+                } else {
+                    0
+                };
+                let to = if li == sel_end.0 {
+                    sel_end.1.min(len)
+                } else {
+                    len
+                };
 
                 if from >= to {
                     return render_md_line(&text, in_code[li]);
@@ -459,6 +489,14 @@ impl LLMTab {
         let cursor = if focused { "_" } else { "" };
         let content = format!("{}{}", self.input, cursor);
 
+        // Compute scroll: auto-scroll to cursor unless the user has scrolled up.
+        let inner_width = area.width.saturating_sub(2) as usize;
+        let max_rows = area.height.saturating_sub(2) as usize;
+        let total_lines = wrapped_line_count(&content, inner_width);
+        // How far from the bottom the user has scrolled (clamped so we can't go past top).
+        let scroll_up = self.input_scroll.min(total_lines.saturating_sub(1));
+        let scroll_top = total_lines.saturating_sub(max_rows).saturating_sub(scroll_up) as u16;
+
         let para = Paragraph::new(content)
             .block(
                 Block::bordered()
@@ -466,20 +504,43 @@ impl LLMTab {
                     .border_style(border_style)
                     .title(Span::styled(" Message ", Theme::dimmed())),
             )
-            .wrap(Wrap { trim: true });
+            .wrap(Wrap { trim: false })
+            .scroll((scroll_top, 0));
 
         frame.render_widget(para, area);
     }
+}
+
+// ── Input helpers ─────────────────────────────────────────────────────────────
+
+/// Count the number of visual rows `text` occupies when wrapped to `width` columns.
+/// Each `\n` starts a new logical line; long lines are counted as multiple rows.
+fn wrapped_line_count(text: &str, width: usize) -> usize {
+    if width == 0 {
+        return text.lines().count().max(1);
+    }
+    text.lines()
+        .map(|l| {
+            let chars = l.chars().count();
+            if chars == 0 { 1 } else { (chars + width - 1) / width }
+        })
+        .sum::<usize>()
+        .max(1)
 }
 
 // ── Markdown rendering helpers ────────────────────────────────────────────────
 
 /// Strip the role prefix / indent from a line to get the raw content.
 fn line_content(text: &str) -> &str {
-    if let Some(rest) = text.strip_prefix("You: ") { rest }
-    else if let Some(rest) = text.strip_prefix("Claude: ") { rest }
-    else if let Some(rest) = text.strip_prefix("      ") { rest }
-    else { text }
+    if let Some(rest) = text.strip_prefix("You: ") {
+        rest
+    } else if let Some(rest) = text.strip_prefix("Claude: ") {
+        rest
+    } else if let Some(rest) = text.strip_prefix("      ") {
+        rest
+    } else {
+        text
+    }
 }
 
 /// Render a single history line with markdown styling applied.
@@ -494,7 +555,11 @@ fn render_md_line(full_text: &str, in_code: bool) -> Line<'static> {
         if let Some(rest) = full_text.strip_prefix("You: ") {
             ("You: ", Some(Theme::chat_user()), rest)
         } else if let Some(rest) = full_text.strip_prefix("Claude: ") {
-            ("Claude: ", Some(Style::default().fg(Color::Rgb(205, 115, 80))), rest)
+            (
+                "Claude: ",
+                Some(Style::default().fg(Color::Rgb(205, 115, 80))),
+                rest,
+            )
         } else if let Some(rest) = full_text.strip_prefix("      ") {
             ("      ", None, rest)
         } else {
@@ -505,7 +570,7 @@ fn render_md_line(full_text: &str, in_code: bool) -> Line<'static> {
     if !prefix_str.is_empty() {
         match prefix_style {
             Some(s) => spans.push(Span::styled(prefix_str.to_string(), s)),
-            None    => spans.push(Span::raw(prefix_str.to_string())),
+            None => spans.push(Span::raw(prefix_str.to_string())),
         }
     }
 
@@ -524,12 +589,16 @@ fn render_md_line(full_text: &str, in_code: bool) -> Line<'static> {
     } else if let Some(rest) = content.strip_prefix("## ") {
         spans.push(Span::styled(
             format!("## {}", rest),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ));
     } else if let Some(rest) = content.strip_prefix("# ") {
         spans.push(Span::styled(
             format!("# {}", rest),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         ));
     } else {
         spans.extend(parse_inline_md(content));
@@ -637,7 +706,9 @@ fn flush_buf(buf: &mut String, spans: &mut Vec<Span<'static>>) {
 /// Find the first occurrence of `seq` in `chars` at or after `from`.
 fn find_seq(chars: &[char], from: usize, seq: &[char]) -> Option<usize> {
     let sl = seq.len();
-    if sl == 0 { return Some(from); }
+    if sl == 0 {
+        return Some(from);
+    }
     for i in from..=chars.len().saturating_sub(sl) {
         if chars[i..i + sl] == *seq {
             return Some(i);
@@ -648,5 +719,8 @@ fn find_seq(chars: &[char], from: usize, seq: &[char]) -> Option<usize> {
 
 /// Find the first occurrence of `target` in `chars` at or after `from`.
 fn find_char_from(chars: &[char], from: usize, target: char) -> Option<usize> {
-    chars[from..].iter().position(|&c| c == target).map(|p| from + p)
+    chars[from..]
+        .iter()
+        .position(|&c| c == target)
+        .map(|p| from + p)
 }

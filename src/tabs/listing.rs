@@ -1,4 +1,4 @@
-use crossterm::event::{Event, KeyCode, KeyEvent};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
@@ -237,7 +237,7 @@ impl Tab for ListingTab {
                 ("e", "edit"),
                 ("d", "delete"),
                 ("/", "filter"),
-                ("q", "quit"),
+                ("ctrl+q", "quit"),
             ],
             ListingMode::Filtering => vec![
                 ("esc", "cancel"),
@@ -257,7 +257,7 @@ impl Tab for ListingTab {
     }
 
     fn handle_event(&mut self, event: &Event) -> Action {
-        let Event::Key(KeyEvent { code, .. }) = event else {
+        let Event::Key(KeyEvent { code, modifiers, .. }) = event else {
             return Action::None;
         };
 
@@ -289,7 +289,7 @@ impl Tab for ListingTab {
                     self.mode = ListingMode::Filtering;
                     Action::None
                 }
-                KeyCode::Char('q') => Action::Quit,
+                KeyCode::Char('q') if modifiers.contains(KeyModifiers::CONTROL) => Action::Quit,
                 _ => Action::None,
             },
 

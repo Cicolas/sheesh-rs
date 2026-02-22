@@ -280,7 +280,7 @@ impl Sheesh {
                         .unwrap_or_default(),
                 };
                 hints.extend(panel_hints);
-                hints.push(("q", "quit"));
+                hints.push(("ctrl+q", "quit"));
                 hints
             }
         };

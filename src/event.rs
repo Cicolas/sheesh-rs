@@ -46,8 +46,7 @@ pub fn map_event(event: &Event) -> Action {
         Event::Key(KeyEvent {
             code, modifiers, ..
         }) => match code {
-            KeyCode::Char('q') if modifiers.is_empty() => Action::Quit,
-            KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => Action::Quit,
+            KeyCode::Char('q') if modifiers.contains(KeyModifiers::CONTROL) => Action::Quit,
             KeyCode::Tab => Action::NextPanel,
             KeyCode::BackTab => Action::PrevPanel,
             KeyCode::Char('j') | KeyCode::Down => Action::Down,

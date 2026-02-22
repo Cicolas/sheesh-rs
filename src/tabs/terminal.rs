@@ -495,11 +495,7 @@ impl Tab for TerminalTab {
     }
 
     fn key_hints(&self) -> Vec<(&str, &str)> {
-        vec![
-            ("F2", "switch panel"),
-            ("F3", "send context"),
-            ("ctrl+d", "disconnect"),
-        ]
+        vec![("ctrl+d", "disconnect")]
     }
 
     fn handle_event(&mut self, event: &Event) -> Action {
@@ -513,6 +509,7 @@ impl Tab for TerminalTab {
                 match code {
                     // ── App-level keys (not forwarded to PTY) ──────────────
                     KeyCode::Char('d') if ctrl => return Action::Disconnect,
+                    KeyCode::Char('q') if ctrl => return Action::Quit,
 
                     // Ctrl+C — copy selection if any, else send ^C to PTY
                     KeyCode::Char('c') if ctrl && !shift => {
