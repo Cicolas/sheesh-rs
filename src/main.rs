@@ -359,8 +359,6 @@ fn contains(rect: Rect, col: u16, row: u16) -> bool {
 }
 
 fn main() -> anyhow::Result<()> {
-    dotenvy::dotenv().ok();
-
     Ftail::new()
         .single_file(Path::new("logs"), true, LevelFilter::Debug)
         .init()
@@ -418,14 +416,27 @@ fn load_llm_config() -> LLMConfig {
         .join("sheesh")
         .join("config.toml");
 
-    if let Ok(content) = std::fs::read_to_string(&path) {
-        #[derive(serde::Deserialize, Default)]
-        struct ConfigFile {
-            #[serde(default)]
-            llm: LLMConfig,
+    log::info!("[config] loading LLM config from {}", path.display());
+
+    match std::fs::read_to_string(&path) {
+        Err(e) => {
+            log::warn!("[config] could not read config file: {} — using defaults", e);
         }
-        if let Ok(cfg) = toml::from_str::<ConfigFile>(&content) {
-            return cfg.llm;
+        Ok(content) => {
+            #[derive(serde::Deserialize, Default)]
+            struct ConfigFile {
+                #[serde(default)]
+                llm: LLMConfig,
+            }
+            match toml::from_str::<ConfigFile>(&content) {
+                Err(e) => {
+                    log::error!("[config] failed to parse config.toml: {} — using defaults", e);
+                }
+                Ok(cfg) => {
+                    log::info!("[config] loaded: provider={} model={}", cfg.llm.provider, cfg.llm.model);
+                    return cfg.llm;
+                }
+            }
         }
     }
 

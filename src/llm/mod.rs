@@ -157,6 +157,9 @@ always explain what a command does before proposing to run it.";
 pub struct LLMConfig {
     pub provider: String,
     pub model: String,
+    /// API key stored directly in the config file (takes precedence over `api_key_env`).
+    pub api_key: Option<String>,
+    /// Name of the environment variable holding the API key (fallback when `api_key` is absent).
     pub api_key_env: String,
     pub ollama_host: String,
     pub ollama_model: String,
@@ -168,6 +171,7 @@ impl Default for LLMConfig {
         Self {
             provider: "anthropic".into(),
             model: "claude-sonnet-4-6".into(),
+            api_key: None,
             api_key_env: "ANTHROPIC_API_KEY".into(),
             ollama_host: "http://localhost:11434".into(),
             ollama_model: "llama3".into(),
@@ -177,18 +181,36 @@ impl Default for LLMConfig {
 }
 
 pub fn build_provider(cfg: &LLMConfig) -> Arc<dyn LLMProvider> {
+    let resolve_key = |cfg: &LLMConfig| -> String {
+        if let Some(k) = cfg.api_key.as_deref().filter(|k| !k.is_empty()) {
+            log::info!("[llm] using api_key from config file");
+            return k.to_string();
+        }
+        match std::env::var(&cfg.api_key_env) {
+            Ok(k) if !k.is_empty() => {
+                log::info!("[llm] using api_key from env var ${}", cfg.api_key_env);
+                k
+            }
+            _ => {
+                log::warn!(
+                    "[llm] API key not found — set api_key in ~/.config/sheesh/config.toml or export ${}",
+                    cfg.api_key_env
+                );
+                String::new()
+            }
+        }
+    };
+
     match cfg.provider.as_str() {
         "openai" => {
-            let key = std::env::var(&cfg.api_key_env).unwrap_or_default();
-            Arc::new(openai::OpenAIProvider::new(key, cfg.model.clone()))
+            Arc::new(openai::OpenAIProvider::new(resolve_key(cfg), cfg.model.clone()))
         }
         "ollama" => Arc::new(ollama::OllamaProvider::new(
             cfg.ollama_host.clone(),
             cfg.ollama_model.clone(),
         )),
         _ => {
-            let key = std::env::var(&cfg.api_key_env).unwrap_or_default();
-            Arc::new(anthropic::AnthropicProvider::new(key, cfg.model.clone()))
+            Arc::new(anthropic::AnthropicProvider::new(resolve_key(cfg), cfg.model.clone()))
         }
     }
 }

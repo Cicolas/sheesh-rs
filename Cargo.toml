@@ -12,7 +12,6 @@ ratatui = "0.30.0"
 ratatui-widgets = "0.3.0"
 
 anyhow = "1"
-dotenvy = "0.15"
 arboard = "3"
 dirs = "5"
 portable-pty = "0.8"

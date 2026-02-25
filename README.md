@@ -52,7 +52,12 @@ Create `~/.config/sheesh/config.toml`:
 [llm]
 provider = "anthropic"          # "anthropic" | "openai" | "ollama"
 model = "claude-sonnet-4-6"
+
+# Provide your key directly:
+api_key = "sk-ant-..."
+# …or via an environment variable (fallback when api_key is absent):
 api_key_env = "ANTHROPIC_API_KEY"
+
 system_prompt = "..."           # optional — overrides the built-in assistant prompt
 
 # Ollama only
@@ -60,7 +65,7 @@ ollama_host = "http://localhost:11434"
 ollama_model = "llama3"
 ```
 
-API keys are read from the environment variable named by `api_key_env`.
+`api_key` takes precedence over `api_key_env`. If neither is set the key is empty and the provider will return an auth error.
 
 ## Keybindings
 
