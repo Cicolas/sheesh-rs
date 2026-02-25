@@ -6,7 +6,7 @@ use std::{
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use log::info;
-use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
+use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use ratatui::{
     Frame,
     layout::Rect,
@@ -20,7 +20,10 @@ use crate::{event::Action, ssh::SSHConnection, ui::theme::Theme};
 use super::Tab;
 
 /// Circular buffer of terminal output lines.
-const MAX_LINES: usize = 2000;
+pub const MAX_LINES: usize = 2000;
+
+/// Number of terminal lines sent to the LLM as context.
+pub const CONTEXT_LINES: usize = 50;
 
 /// A (line_index, col) position in the line buffer.
 type BufPos = (usize, usize);
@@ -259,6 +262,7 @@ fn plain_text(line: &[StyledSpan]) -> String {
 pub struct TerminalTab {
     lines: Arc<Mutex<Vec<Vec<StyledSpan>>>>,
     pty_writer: Option<Box<dyn Write + Send>>,
+    pty_master: Option<Box<dyn MasterPty>>,
     alive: Arc<Mutex<bool>>,
     /// Set to true by clear_buffer(); reader thread resets its partial on next tick.
     clear_signal: Arc<Mutex<bool>>,
@@ -270,6 +274,9 @@ pub struct TerminalTab {
     /// Saved from last render to convert mouse coords → buffer coords.
     last_render_start: usize,
     last_inner: Rect,
+    /// Maps each visible screen row → (buffer line index, byte offset within that line).
+    /// Accounts for wrapped lines so mouse hit-testing stays accurate.
+    last_visual_row_map: Vec<(usize, usize)>,
     /// Kept alive so the OS clipboard doesn't lose data when we drop it.
     clipboard: Option<arboard::Clipboard>,
 }
@@ -295,6 +302,7 @@ impl TerminalTab {
 
         let master_writer = pair.master.take_writer()?;
         let mut master_reader = pair.master.try_clone_reader()?;
+        let pty_master = pair.master;
 
         let lines: Arc<Mutex<Vec<Vec<StyledSpan>>>> = Arc::new(Mutex::new(vec![]));
         let alive: Arc<Mutex<bool>> = Arc::new(Mutex::new(true));
@@ -325,7 +333,6 @@ impl TerminalTab {
                             }
                         }
 
-                        info!("{:?} ({} bytes)", buf, n);
                         let chunk = String::from_utf8_lossy(&buf[..n]);
                         partial.push_str(&chunk);
 
@@ -364,6 +371,7 @@ impl TerminalTab {
         Ok(Self {
             lines,
             pty_writer: Some(master_writer),
+            pty_master: Some(pty_master),
             alive,
             clear_signal,
             connection_name: conn.name.clone(),
@@ -371,12 +379,29 @@ impl TerminalTab {
             selection: None,
             last_render_start: 0,
             last_inner: Rect::default(),
+            last_visual_row_map: vec![],
             clipboard: arboard::Clipboard::new().ok(),
         })
     }
 
     pub fn is_alive(&self) -> bool {
         *self.alive.lock().unwrap()
+    }
+
+    /// Returns the current number of buffered lines.
+    pub fn line_count(&self) -> usize {
+        self.lines.lock().unwrap().len()
+    }
+
+    /// Returns all lines appended since `from_line` as a single string.
+    pub fn capture_since(&self, from_line: usize) -> String {
+        let lock = self.lines.lock().unwrap();
+        let start = from_line.min(lock.len());
+        lock[start..]
+            .iter()
+            .map(|l| plain_text(l))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Snapshot of current terminal output for sending to LLM.
@@ -411,7 +436,9 @@ impl TerminalTab {
         self.scroll_offset = self.scroll_offset.saturating_sub(3);
     }
 
-    /// Convert a screen (col, row) into a buffer (line_index, col).
+    /// Convert a screen (col, row) into a buffer (line_index, byte_offset).
+    /// Uses the visual row map built during the last render; each map entry corresponds
+    /// to exactly one pre-split display row so no ratatui wrapping is involved.
     fn screen_to_buf(&self, col: u16, row: u16) -> Option<BufPos> {
         let inner = self.last_inner;
         if row < inner.y || row >= inner.y + inner.height {
@@ -420,9 +447,21 @@ impl TerminalTab {
         if col < inner.x {
             return None;
         }
-        let buf_line = self.last_render_start + (row - inner.y) as usize;
-        let buf_col = (col - inner.x) as usize;
-        Some((buf_line, buf_col))
+        let screen_row = (row - inner.y) as usize;
+        let screen_col = (col - inner.x) as usize;
+
+        let &(buf_line, row_byte_start) = self.last_visual_row_map.get(screen_row)?;
+
+        // screen_col is a char index within this pre-split row; convert to bytes.
+        let lock = self.lines.lock().unwrap();
+        let text = plain_text(&lock[buf_line]);
+        let byte_col: usize = text[row_byte_start..]
+            .chars()
+            .take(screen_col)
+            .map(|c| c.len_utf8())
+            .sum();
+
+        Some((buf_line, row_byte_start + byte_col))
     }
 
     /// Normalise selection so (start <= end) in reading order.
@@ -631,6 +670,16 @@ impl Tab for TerminalTab {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
+        if inner != self.last_inner {
+            if let Some(ref master) = self.pty_master {
+                let _ = master.resize(PtySize {
+                    rows: inner.height.max(1),
+                    cols: inner.width.max(1),
+                    pixel_width: 0,
+                    pixel_height: 0,
+                });
+            }
+        }
         self.last_inner = inner;
 
         let visible_height = inner.height as usize;
@@ -644,47 +693,114 @@ impl Tab for TerminalTab {
             let start = max_scroll - self.scroll_offset;
             self.last_render_start = start;
 
-            lock[start..]
-                .iter()
-                .enumerate()
-                .take(visible_height)
-                .map(|(screen_row, line)| {
-                    let buf_line = start + screen_row;
-                    render_line(line, buf_line, sel)
-                })
-                .collect()
+            let width = inner.width.max(1) as usize;
+            let mut visual_map: Vec<(usize, usize)> = Vec::with_capacity(visible_height);
+            let mut display: Vec<Line<'static>> = Vec::with_capacity(visible_height);
+
+            'outer: for (buf_idx, line) in lock.iter().enumerate().skip(start) {
+                for (chunk, row_byte_start) in wrap_spans(line, width) {
+                    if display.len() >= visible_height {
+                        break 'outer;
+                    }
+                    visual_map.push((buf_idx, row_byte_start));
+                    display.push(render_chunk(&chunk, buf_idx, row_byte_start, sel));
+                }
+            }
+
+            self.last_visual_row_map = visual_map;
+            display
         };
 
         frame.render_widget(Paragraph::new(display), inner);
     }
 }
 
-/// Render a single styled line, overlaying the selection highlight where applicable.
-fn render_line(
-    spans: &[StyledSpan],
+/// Split `spans` into visual rows of at most `width` characters each.
+/// Returns a list of `(chunk_spans, byte_offset_in_original_line)` pairs.
+fn wrap_spans(spans: &[StyledSpan], width: usize) -> Vec<(Vec<StyledSpan>, usize)> {
+    if width == 0 {
+        return vec![(spans.to_vec(), 0)];
+    }
+    let mut rows: Vec<(Vec<StyledSpan>, usize)> = Vec::new();
+    let mut current: Vec<StyledSpan> = Vec::new();
+    let mut chars_in_row: usize = 0;
+    let mut line_byte_offset: usize = 0; // bytes consumed from the start of the full line
+    let mut row_byte_start: usize = 0;   // byte offset where the current row starts
+
+    for span in spans {
+        let mut remaining = span.text.as_str();
+        let style = span.style;
+
+        while !remaining.is_empty() {
+            let capacity = width - chars_in_row;
+            let char_count = remaining.chars().count();
+
+            if char_count <= capacity {
+                current.push(StyledSpan { text: remaining.to_string(), style });
+                chars_in_row += char_count;
+                line_byte_offset += remaining.len();
+                remaining = "";
+            } else {
+                // Take exactly `capacity` chars to fill the current row.
+                let split_byte: usize =
+                    remaining.chars().take(capacity).map(|c| c.len_utf8()).sum();
+                let (head, tail) = remaining.split_at(split_byte);
+
+                if !head.is_empty() {
+                    current.push(StyledSpan { text: head.to_string(), style });
+                }
+                line_byte_offset += head.len();
+
+                // Flush completed row.
+                rows.push((std::mem::take(&mut current), row_byte_start));
+                row_byte_start = line_byte_offset;
+                chars_in_row = 0;
+                remaining = tail;
+            }
+        }
+    }
+
+    // Always emit the final (possibly empty) row so blank lines are shown.
+    rows.push((current, row_byte_start));
+    rows
+}
+
+/// Render a pre-split chunk, applying selection highlight using chunk-local byte offsets.
+/// `row_byte_start` is the byte offset within the original buffer line where this chunk begins.
+fn render_chunk(
+    chunk: &[StyledSpan],
     buf_line: usize,
+    row_byte_start: usize,
     sel: Option<(BufPos, BufPos)>,
 ) -> Line<'static> {
     let sel_style = Style::default().bg(Color::White).fg(Color::Black);
+    let chunk_len: usize = chunk.iter().map(|s| s.text.len()).sum();
 
-    // Determine byte-offset selection range for this line.
+    // Map the full-line selection into chunk-local byte offsets.
     let sel_range: Option<(usize, usize)> = sel.and_then(|(s, e)| {
         if buf_line < s.0 || buf_line > e.0 {
             return None;
         }
-        let total: usize = spans.iter().map(|sp| sp.text.len()).sum();
-        let from = if buf_line == s.0 { s.1.min(total) } else { 0 };
-        let to = if buf_line == e.0 {
-            e.1.min(total)
+        let full_from = if buf_line == s.0 { s.1 } else { 0 };
+        let full_to = if buf_line == e.0 { e.1 } else { usize::MAX };
+
+        let chunk_end = row_byte_start + chunk_len;
+        // Selection must overlap this chunk's byte range [row_byte_start, chunk_end).
+        if full_to <= row_byte_start || full_from >= chunk_end {
+            return None;
+        }
+        let from = full_from.saturating_sub(row_byte_start).min(chunk_len);
+        let to = if full_to == usize::MAX {
+            chunk_len
         } else {
-            total
+            full_to.saturating_sub(row_byte_start).min(chunk_len)
         };
         if from < to { Some((from, to)) } else { None }
     });
 
     let Some((sel_from, sel_to)) = sel_range else {
         return Line::from(
-            spans
+            chunk
                 .iter()
                 .filter(|s| !s.text.is_empty())
                 .map(|s| Span::styled(s.text.clone(), s.style))
@@ -693,9 +809,9 @@ fn render_line(
     };
 
     let mut result: Vec<Span<'static>> = Vec::new();
-    let mut pos = 0usize;
+    let mut pos: usize = 0;
 
-    for span in spans {
+    for span in chunk {
         let text = &span.text;
         let len = text.len();
         let span_end = pos + len;
@@ -707,11 +823,7 @@ fn render_line(
         } else {
             let a = sel_from.saturating_sub(pos).min(len);
             let b = sel_to.saturating_sub(pos).min(len);
-            // Clamp to valid UTF-8 char boundaries.
-            let a = (0..=a)
-                .rev()
-                .find(|&i| text.is_char_boundary(i))
-                .unwrap_or(0);
+            let a = (0..=a).rev().find(|&i| text.is_char_boundary(i)).unwrap_or(0);
             let b = (b..=len).find(|&i| text.is_char_boundary(i)).unwrap_or(len);
             if a > 0 {
                 result.push(Span::styled(text[..a].to_string(), span.style));
@@ -723,7 +835,6 @@ fn render_line(
                 result.push(Span::styled(text[b..].to_string(), span.style));
             }
         }
-
         pos += len;
     }
 

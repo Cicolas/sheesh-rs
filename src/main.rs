@@ -26,8 +26,17 @@ use app::{AppState, ConnectedFocus};
 use config::{load_connections, save_connections, ssh_config_path};
 use event::Action;
 use llm::{LLMConfig, build_provider};
-use tabs::{Tab, listing::ListingTab, llm::LLMTab, terminal::TerminalTab};
+use tabs::{Tab, listing::ListingTab, llm::LLMTab, terminal::{CONTEXT_LINES, TerminalTab}};
 use ui::{keybindings::render_keybindings, theme::Theme};
+
+/// Captures terminal output produced by a tool-call command and forwards it
+/// to the LLM once the deadline elapses.
+struct PendingCapture {
+    /// Number of terminal lines present *before* the command was sent.
+    snapshot: usize,
+    /// When to stop waiting and send whatever has been captured so far.
+    deadline: std::time::Instant,
+}
 
 struct Sheesh {
     state: AppState,
@@ -39,6 +48,8 @@ struct Sheesh {
     /// Last known areas for the two connected panels — used for mouse click focus.
     terminal_area: Rect,
     llm_area: Rect,
+    /// Pending terminal output capture for an in-flight tool call.
+    pending_capture: Option<PendingCapture>,
 }
 
 impl Sheesh {
@@ -52,6 +63,7 @@ impl Sheesh {
             terminal_area: Rect::default(),
             llm_area: Rect::default(),
             error: None,
+            pending_capture: None,
         }
     }
 
@@ -79,7 +91,7 @@ impl Sheesh {
 
         let provider = build_provider(&self.llm_config);
         self.terminal = Some(terminal);
-        self.llm = Some(LLMTab::new(provider));
+        self.llm = Some(LLMTab::new(provider, self.llm_config.system_prompt.clone()));
         self.state = AppState::Connected {
             connection_name: name,
             focus: ConnectedFocus::Terminal,
@@ -103,7 +115,7 @@ impl Sheesh {
 
     fn send_context_to_llm(&mut self) {
         if let (Some(terminal), Some(llm)) = (&self.terminal, &mut self.llm) {
-            let ctx = terminal.visible_text(50);
+            let ctx = terminal.visible_text(CONTEXT_LINES);
             let question = std::mem::take(&mut llm.input);
             llm.send_with_context(ctx, question);
         }
@@ -196,8 +208,15 @@ impl Sheesh {
                     Action::Disconnect => self.disconnect(),
                     Action::SendToTerminal(cmd) => {
                         if let Some(t) = &mut self.terminal {
+                            let snapshot = t.line_count();
                             t.send_string(&cmd);
                             t.send_string("\r");
+                            // Capture output for 1.5 s then forward it to Claude.
+                            self.pending_capture = Some(PendingCapture {
+                                snapshot,
+                                deadline: std::time::Instant::now()
+                                    + std::time::Duration::from_millis(1500),
+                            });
                         }
                         if let AppState::Connected { ref mut focus, .. } = self.state {
                             *focus = ConnectedFocus::Terminal;
@@ -343,7 +362,7 @@ fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
     Ftail::new()
-        .single_file(Path::new("logs"), true, LevelFilter::Info)
+        .single_file(Path::new("logs"), true, LevelFilter::Debug)
         .init()
         .unwrap();
 
@@ -360,6 +379,22 @@ fn main() -> anyhow::Result<()> {
         |terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>| -> std::io::Result<()> {
             loop {
                 terminal.draw(|f| app.draw(f))?;
+
+                // Forward captured terminal output to Claude once the deadline elapses.
+                if let Some(ref cap) = app.pending_capture {
+                    if std::time::Instant::now() >= cap.deadline {
+                        let snapshot = cap.snapshot;
+                        app.pending_capture = None;
+                        if let (Some(terminal), Some(llm)) =
+                            (&app.terminal, &mut app.llm)
+                        {
+                            if llm.awaiting_output_id.is_some() {
+                                let output = terminal.capture_since(snapshot);
+                                llm.resume_with_output(output);
+                            }
+                        }
+                    }
+                }
 
                 if poll(Duration::from_millis(5))? {
                     let ev = read()?;
