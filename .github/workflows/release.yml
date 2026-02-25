@@ -1,0 +1,89 @@
+name: Release AppImage
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-appimage:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxcb1-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libssl-dev \
+            pkg-config \
+            fuse
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Download appimagetool
+        run: |
+          wget -q "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage" \
+            -O /usr/local/bin/appimagetool
+          chmod +x /usr/local/bin/appimagetool
+
+      - name: Create AppDir
+        run: |
+          mkdir -p AppDir/usr/bin
+          cp target/release/sheesh-rs AppDir/usr/bin/sheesh-rs
+
+          # Desktop entry
+          cat > AppDir/sheesh-rs.desktop <<'EOF'
+          [Desktop Entry]
+          Name=Sheesh
+          Exec=sheesh-rs
+          Icon=sheesh-rs
+          Type=Application
+          Categories=Utility;TerminalEmulator;
+          Terminal=true
+          EOF
+
+          # Icon
+          cp logo.png AppDir/sheesh-rs.png
+
+          # AppRun
+          cat > AppDir/AppRun <<'EOF'
+          #!/bin/sh
+          exec "$APPDIR/usr/bin/sheesh-rs" "$@"
+          EOF
+          chmod +x AppDir/AppRun
+
+      - name: Build AppImage
+        env:
+          ARCH: x86_64
+        run: |
+          # appimagetool needs FUSE; use extract-and-run workaround in CI
+          appimagetool --appimage-extract-and-run AppDir sheesh-rs-${{ github.ref_name }}-x86_64.AppImage
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: sheesh-rs-${{ github.ref_name }}-x86_64.AppImage
+          generate_release_notes: true

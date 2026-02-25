@@ -19,9 +19,29 @@ A terminal UI for managing SSH connections with an embedded LLM assistant.
 
 ## Installation
 
+### AppImage (Linux, pre-built)
+
+Download the latest `sheesh-rs-*-x86_64.AppImage` from the [Releases](../../releases) page, then:
+
+```bash
+chmod +x sheesh-rs-*-x86_64.AppImage
+./sheesh-rs-*-x86_64.AppImage
+```
+
+### Build from source
+
 ```bash
 cargo build --release
 # binary at target/release/sheesh-rs
+```
+
+### Release a new version (maintainers)
+
+Tag a commit — the CI workflow builds and publishes the AppImage automatically:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
 ```
 
 ## Configuration
