@@ -12,6 +12,7 @@ use ratatui::{
 use crate::{
     event::Action,
     llm::{ContentBlock, LLMEvent, LLMProvider, Message, RichMessage, Role, spawn_completion_rich},
+    ssh::SSHConnection,
     ui::theme::Theme,
 };
 
@@ -66,12 +67,14 @@ pub struct LLMTab {
     /// When true, future tool calls execute without asking.
     auto_approve: bool,
     clipboard: Option<arboard::Clipboard>,
+    /// SSH connection info used to resolve the system_information tool locally.
+    connection: SSHConnection,
     /// Maps each visible chat screen row → (build_lines index, byte offset in that string).
     last_visual_row_map: Vec<(usize, usize)>,
 }
 
 impl LLMTab {
-    pub fn new(provider: Arc<dyn LLMProvider>, system_prompt: Option<String>) -> Self {
+    pub fn new(provider: Arc<dyn LLMProvider>, system_prompt: Option<String>, connection: SSHConnection) -> Self {
         let (tx, rx) = mpsc::channel();
         let mut rich_history = vec![];
         if let Some(prompt) = system_prompt {
@@ -98,6 +101,7 @@ impl LLMTab {
             awaiting_output_id: None,
             auto_approve: false,
             clipboard: arboard::Clipboard::new().ok(),
+            connection,
             last_visual_row_map: vec![],
             rich_history,
         }
@@ -153,6 +157,43 @@ impl LLMTab {
                     }
                     self.scroll_offset = 0;
                 }
+                LLMEvent::LocalTool { id: api_id, name, input: _, assistant_blocks } => {
+                    // Replace api id with a locally unique one.
+                    let local_id = unique_tool_id();
+                    let assistant_blocks: Vec<ContentBlock> = assistant_blocks
+                        .into_iter()
+                        .map(|b| match b {
+                            ContentBlock::ToolUse { id, name, input } if id == api_id => {
+                                ContentBlock::ToolUse { id: local_id.clone(), name, input }
+                            }
+                            other => other,
+                        })
+                        .collect();
+
+                    // Show any text produced before the tool call.
+                    let pre_text: String = assistant_blocks
+                        .iter()
+                        .filter_map(|b| if let ContentBlock::Text { text } = b { Some(text.as_str()) } else { None })
+                        .collect::<Vec<_>>()
+                        .join("");
+                    if !pre_text.trim().is_empty() {
+                        self.history.push(Message::assistant(pre_text));
+                    }
+
+                    // Resolve the tool result locally.
+                    let result = self.resolve_local_tool(&name);
+
+                    // Commit to rich history and immediately resume Claude.
+                    self.rich_history.push(RichMessage {
+                        role: Role::Assistant,
+                        content: assistant_blocks,
+                    });
+                    self.rich_history.push(RichMessage::tool_result(&local_id, &result));
+                    self.waiting = true;
+                    self.status = format!("{}… waiting for Claude…", name);
+                    spawn_completion_rich(Arc::clone(&self.provider), self.rich_history.clone(), self.tx.clone());
+                    self.scroll_offset = 0;
+                }
                 LLMEvent::Error(err) => {
                     self.status = format!("Error: {}", err);
                     self.history.push(Message::assistant(format!("[error] {}", err)));
@@ -198,6 +239,32 @@ impl LLMTab {
     }
 
     /// Called by `main.rs` after the terminal output has been captured.
+    /// Returns true while the LLM is in the middle of a tool-execution cycle
+    /// (pending confirmation, command sent, or waiting for Claude to respond).
+    pub fn is_executing_tool(&self) -> bool {
+        self.pending_tool_call.is_some() || self.awaiting_output_id.is_some()
+    }
+
+    /// Resolve a local tool call (no PTY needed) and return its result string.
+    fn resolve_local_tool(&self, name: &str) -> String {
+        match name {
+            "system_information" => {
+                let c = &self.connection;
+                format!(
+                    "Host: {}\nHostname: {}\nUser: {}\nPort: {}\nDescription: {}\nIdentityFile: {}\nExtraOptions: {}",
+                    c.name,
+                    c.hostname,
+                    c.user,
+                    if c.port == 0 { 22 } else { c.port },
+                    if c.description.is_empty() { "(none)" } else { &c.description },
+                    c.identity_file.as_deref().unwrap_or("(none)"),
+                    if c.extra_options.is_empty() { "(none)".to_string() } else { c.extra_options.join(", ") },
+                )
+            }
+            other => format!("Unknown local tool: {}", other),
+        }
+    }
+
     /// Appends the output as a tool_result and resumes the LLM.
     pub fn resume_with_output(&mut self, output: String) {
         let id = match self.awaiting_output_id.take() {
@@ -279,10 +346,6 @@ impl LLMTab {
                     all.push((format!("      {}", line), None));
                 }
             }
-            all.push((String::new(), None));
-        }
-        // Trailing padding so the last message can be scrolled above the bottom edge.
-        for _ in 0..10 {
             all.push((String::new(), None));
         }
         all
@@ -613,15 +676,35 @@ impl LLMTab {
         };
 
         let all = self.build_lines();
-        let total = all.len();
         let h = history_area.height as usize;
-        let max_scroll = total.saturating_sub(h);
-        self.scroll_offset = self.scroll_offset.min(max_scroll);
-        let start = max_scroll - self.scroll_offset;
-        self.last_render_start = start;
-
         let sel = self.selection_range();
         let width = history_area.width.max(1) as usize;
+
+        // Compute total visual rows (accounts for line wrapping).
+        let total_visual: usize = all.iter().map(|(text, _)| wrapped_line_count(text, width)).sum();
+
+        // scroll_offset and max_scroll are in visual rows.
+        let max_scroll = total_visual.saturating_sub(h);
+        self.scroll_offset = self.scroll_offset.min(max_scroll);
+
+        // How many visual rows to skip from the top of the buffer.
+        let skip_rows = total_visual.saturating_sub(h + self.scroll_offset);
+
+        // Walk forward to find the starting logical line and intra-line row offset.
+        let mut skipped = 0usize;
+        let mut start_li = all.len();
+        let mut start_intra = 0usize;
+        for (i, (text, _)) in all.iter().enumerate() {
+            let count = wrapped_line_count(text, width);
+            if skipped + count > skip_rows {
+                start_li = i;
+                start_intra = skip_rows - skipped;
+                break;
+            }
+            skipped += count;
+        }
+
+        self.last_render_start = start_li;
 
         // Pre-compute which lines fall inside a markdown code block or are tables.
         let in_code: Vec<bool> = {
@@ -645,9 +728,12 @@ impl LLMTab {
         let mut visual_map: Vec<(usize, usize)> = Vec::new();
         let mut visible: Vec<Line<'static>> = Vec::new();
 
-        'outer: for (li, (text, _)) in all.iter().enumerate().skip(start) {
+        'outer: for (li, (text, _)) in all.iter().enumerate().skip(start_li) {
             let rendered = render_md_line(text, in_code[li]);
-            for (chunk_spans, row_byte_start) in wrap_line_spans(rendered.spans, width) {
+            for (row_i, (chunk_spans, row_byte_start)) in wrap_line_spans(rendered.spans, width).into_iter().enumerate() {
+                if li == start_li && row_i < start_intra {
+                    continue;
+                }
                 if visible.len() >= h {
                     break 'outer;
                 }

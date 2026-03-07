@@ -91,7 +91,7 @@ impl RichMessage {
 pub enum LLMEvent {
     /// Full text response — conversation continues normally.
     Response(String),
-    /// Claude wants to run a command; user must confirm before we resume.
+    /// Claude wants to run a shell command on the PTY; user must confirm before it runs.
     ToolCall {
         /// Tool-use block id — echoed back in the tool_result.
         id: String,
@@ -100,6 +100,13 @@ pub enum LLMEvent {
         /// Optional one-line description Claude provided.
         description: Option<String>,
         /// Full assistant content blocks (text + tool_use) for rich history.
+        assistant_blocks: Vec<ContentBlock>,
+    },
+    /// Claude invoked a tool that is resolved locally (no PTY needed).
+    LocalTool {
+        id: String,
+        name: String,
+        input: serde_json::Value,
         assistant_blocks: Vec<ContentBlock>,
     },
     /// An error occurred.
