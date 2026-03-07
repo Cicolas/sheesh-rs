@@ -2229,6 +2229,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "termwiz",
  "toml",
 ]
 

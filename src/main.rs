@@ -91,7 +91,7 @@ impl Sheesh {
 
         let provider = build_provider(&self.llm_config);
         self.terminal = Some(terminal);
-        self.llm = Some(LLMTab::new(provider, self.llm_config.system_prompt.clone()));
+        self.llm = Some(LLMTab::new(provider, self.llm_config.system_prompt.clone(), conn.clone()));
         self.state = AppState::Connected {
             connection_name: name,
             focus: ConnectedFocus::Terminal,
@@ -146,6 +146,16 @@ impl Sheesh {
                     ..
                 }) => {
                     self.send_context_to_llm();
+                    return true;
+                }
+                // F4 — toggle terminal user lock (works regardless of focused panel)
+                crossterm::event::Event::Key(KeyEvent {
+                    code: KeyCode::F(4),
+                    ..
+                }) => {
+                    if let Some(t) = &mut self.terminal {
+                        t.toggle_user_lock();
+                    }
                     return true;
                 }
                 // Mouse click — focus the panel that was clicked.
@@ -211,6 +221,7 @@ impl Sheesh {
                             let snapshot = t.line_count();
                             t.send_string(&cmd);
                             t.send_string("\r");
+                            t.set_tool_locked(true);
                             // Capture output for 1.5 s then forward it to Claude.
                             self.pending_capture = Some(PendingCapture {
                                 snapshot,
@@ -294,7 +305,13 @@ impl Sheesh {
         let hints: Vec<(&str, &str)> = match &self.state {
             AppState::Listing => self.listing.key_hints(),
             AppState::Connected { focus, .. } => {
+                let lock_hint = self.terminal.as_ref().map(|t| {
+                    if t.is_locked() { ("F4", "unlock terminal") } else { ("F4", "lock terminal") }
+                });
                 let mut hints = vec![("F2", "switch panel"), ("F3", "send context")];
+                if let Some(h) = lock_hint {
+                    hints.push(h);
+                }
                 let panel_hints: Vec<(&str, &str)> = match focus {
                     ConnectedFocus::Terminal => self
                         .terminal
@@ -391,6 +408,13 @@ fn main() -> anyhow::Result<()> {
                                 llm.resume_with_output(output);
                             }
                         }
+                    }
+                }
+
+                // Release the tool lock once the LLM finishes the tool-execution cycle.
+                if let (Some(terminal), Some(llm)) = (&mut app.terminal, &app.llm) {
+                    if terminal.tool_locked && !llm.is_executing_tool() && !llm.waiting {
+                        terminal.set_tool_locked(false);
                     }
                 }
 

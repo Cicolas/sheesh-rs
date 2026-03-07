@@ -1,8 +1,16 @@
+use std::time::Duration;
+
 use anyhow::{Context, Result};
-use log::{debug, error};
+use log::{debug, error, warn};
 use serde_json::{json, Value};
 
 use super::{ContentBlock, LLMEvent, LLMProvider, Message, RichMessage, Role};
+
+const RETRY_DELAYS: &[Duration] = &[
+    Duration::from_millis(500),
+    Duration::from_millis(2000),
+    Duration::from_millis(4000),
+];
 
 pub struct AnthropicProvider {
     api_key: String,
@@ -18,49 +26,131 @@ impl AnthropicProvider {
         debug!("[Anthropic] POST /v1/messages model={} messages={}", self.model, body["messages"].as_array().map(|a| a.len()).unwrap_or(0));
 
         let client = reqwest::blocking::Client::new();
-        let resp = client
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .context("sending request to Anthropic")?;
+        let mut last_err: anyhow::Error = anyhow::anyhow!("no attempts made");
 
-        let status = resp.status();
-        debug!("[Anthropic] response status={}", status);
+        for attempt in 0..=RETRY_DELAYS.len() {
+            if attempt > 0 {
+                let delay = RETRY_DELAYS[attempt - 1];
+                warn!("[Anthropic] retry {}/{} after {}ms", attempt, RETRY_DELAYS.len(), delay.as_millis());
+                std::thread::sleep(delay);
+            }
 
-        let json: Value = resp.json().context("parsing Anthropic response")?;
+            let resp = match client
+                .post("https://api.anthropic.com/v1/messages")
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json")
+                .json(&body)
+                .send()
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("[Anthropic] request error (attempt {}): {}", attempt + 1, e);
+                    last_err = anyhow::Error::from(e).context("sending request to Anthropic");
+                    continue;
+                }
+            };
 
-        if !status.is_success() {
-            error!("[Anthropic] error response: {}", json);
+            let status = resp.status();
+            debug!("[Anthropic] response status={}", status);
+
+            let json: Value = match resp.json().context("parsing Anthropic response") {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("[Anthropic] parse error (attempt {}): {}", attempt + 1, e);
+                    last_err = e;
+                    continue;
+                }
+            };
+
+            if status.is_server_error() || status.as_u16() == 429 {
+                error!("[Anthropic] retryable error response (attempt {}): {}", attempt + 1, json);
+                last_err = anyhow::anyhow!("Anthropic error {}: {}", status, json);
+                continue;
+            }
+
+            if !status.is_success() {
+                error!("[Anthropic] error response: {}", json);
+            }
+
+            return Ok(json);
         }
 
-        Ok(json)
+        Err(last_err)
     }
 }
 
-/// The `run_command` tool definition sent to Claude on every rich request.
-fn run_command_tool() -> Value {
-    json!({
-        "name": "run_command",
-        "description": "Execute a shell command on the user's remote SSH session. \
-                         The user will be shown the command and must approve before it runs.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "description": "The exact shell command to execute."
+/// All tool definitions sent to Claude on every rich request.
+fn all_tools() -> Value {
+    json!([
+        {
+            "name": "run_command",
+            "description": "Execute an arbitrary shell command on the user's remote SSH session. \
+                             The user will be shown the command and must approve before it runs.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string", "description": "The exact shell command to execute." },
+                    "description": { "type": "string", "description": "One-sentence plain-English explanation of what this command does." }
                 },
-                "description": {
-                    "type": "string",
-                    "description": "One-sentence plain-English explanation of what this command does."
-                }
-            },
-            "required": ["command"]
+                "required": ["command"]
+            }
+        },
+        {
+            "name": "system_information",
+            "description": "Return the SSH connection settings for the current session (host, user, port, description, identity file, extra options). No PTY interaction needed.",
+            "input_schema": { "type": "object", "properties": {}, "required": [] }
+        },
+        {
+            "name": "make_dir",
+            "description": "Create a directory (and any missing parents) on the remote host using mkdir -p.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Absolute or relative path of the directory to create." }
+                },
+                "required": ["path"]
+            }
+        },
+        {
+            "name": "touch_file",
+            "description": "Create an empty file (or update its timestamp) on the remote host using touch.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "file": { "type": "string", "description": "Path of the file to create or touch." }
+                },
+                "required": ["file"]
+            }
+        },
+        {
+            "name": "read_file",
+            "description": "Read and return the contents of a file on the remote host using cat.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "file": { "type": "string", "description": "Path of the file to read." }
+                },
+                "required": ["file"]
+            }
+        },
+        {
+            "name": "list_dir",
+            "description": "List the contents of a directory on the remote host using ls -la.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Directory path to list. Defaults to current directory." }
+                },
+                "required": []
+            }
         }
-    })
+    ])
+}
+
+/// Wrap a path/filename in single quotes, escaping any embedded single quotes.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// Convert a `RichMessage` to the JSON format Anthropic expects.
@@ -173,7 +263,7 @@ impl LLMProvider for AnthropicProvider {
         let mut body = json!({
             "model": self.model,
             "max_tokens": 8096,
-            "tools": [run_command_tool()],
+            "tools": all_tools(),
             "messages": msgs,
         });
 
@@ -198,12 +288,6 @@ impl LLMProvider for AnthropicProvider {
             let name = tool_use["name"].as_str().unwrap_or("").to_string();
             let input = tool_use["input"].clone();
 
-            let command = input["command"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("run_command tool missing 'command' field"))?
-                .to_string();
-            let description = input["description"].as_str().map(|s| s.to_string());
-
             // Build the content blocks to append to rich history.
             let mut assistant_blocks: Vec<ContentBlock> = vec![];
             for block in &content {
@@ -226,13 +310,53 @@ impl LLMProvider for AnthropicProvider {
                 }
             }
 
-            debug!("[Anthropic] tool_call: name={} command={:?}", name, command);
-            return Ok(LLMEvent::ToolCall {
-                id,
-                command,
-                description,
-                assistant_blocks,
-            });
+            // Dispatch by tool name.
+            match name.as_str() {
+                "system_information" => {
+                    debug!("[Anthropic] local tool: system_information");
+                    return Ok(LLMEvent::LocalTool { id, name, input, assistant_blocks });
+                }
+                "run_command" => {
+                    let command = input["command"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("run_command missing 'command' field"))?
+                        .to_string();
+                    let description = input["description"].as_str().map(|s| s.to_string());
+                    debug!("[Anthropic] tool_call: run_command command={:?}", command);
+                    return Ok(LLMEvent::ToolCall { id, command, description, assistant_blocks });
+                }
+                "make_dir" => {
+                    let path = input["path"].as_str().unwrap_or(".");
+                    let command = format!("mkdir -p {}", shell_quote(path));
+                    let description = Some(format!("Create directory {}", path));
+                    debug!("[Anthropic] tool_call: make_dir path={:?}", path);
+                    return Ok(LLMEvent::ToolCall { id, command, description, assistant_blocks });
+                }
+                "touch_file" => {
+                    let file = input["file"].as_str().unwrap_or("");
+                    let command = format!("touch {}", shell_quote(file));
+                    let description = Some(format!("Create/touch file {}", file));
+                    debug!("[Anthropic] tool_call: touch_file file={:?}", file);
+                    return Ok(LLMEvent::ToolCall { id, command, description, assistant_blocks });
+                }
+                "read_file" => {
+                    let file = input["file"].as_str().unwrap_or("");
+                    let command = format!("cat {}", shell_quote(file));
+                    let description = Some(format!("Read file {}", file));
+                    debug!("[Anthropic] tool_call: read_file file={:?}", file);
+                    return Ok(LLMEvent::ToolCall { id, command, description, assistant_blocks });
+                }
+                "list_dir" => {
+                    let path = input["path"].as_str().unwrap_or(".");
+                    let command = format!("ls -la {}", shell_quote(path));
+                    let description = Some(format!("List directory {}", path));
+                    debug!("[Anthropic] tool_call: list_dir path={:?}", path);
+                    return Ok(LLMEvent::ToolCall { id, command, description, assistant_blocks });
+                }
+                other => {
+                    return Err(anyhow::anyhow!("unknown tool: {}", other));
+                }
+            }
         }
 
         // Normal text response.
