@@ -300,10 +300,15 @@ impl LLMProvider for AnthropicProvider {
                         }
                     }
                     Some("tool_use") => {
+                        // Use each block's own id/name/input — not the outer `id`/`name`/`input`
+                        // — so that multiple tool_use blocks in one response don't share the same id.
+                        let block_id = block["id"].as_str().unwrap_or("").to_string();
+                        let block_name = block["name"].as_str().unwrap_or("").to_string();
+                        let block_input = block["input"].clone();
                         assistant_blocks.push(ContentBlock::ToolUse {
-                            id: id.clone(),
-                            name: name.clone(),
-                            input: input.clone(),
+                            id: block_id,
+                            name: block_name,
+                            input: block_input,
                         });
                     }
                     _ => {}

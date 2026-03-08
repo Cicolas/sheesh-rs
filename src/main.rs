@@ -148,16 +148,6 @@ impl Sheesh {
                     self.send_context_to_llm();
                     return true;
                 }
-                // F4 — toggle terminal user lock (works regardless of focused panel)
-                crossterm::event::Event::Key(KeyEvent {
-                    code: KeyCode::F(4),
-                    ..
-                }) => {
-                    if let Some(t) = &mut self.terminal {
-                        t.toggle_user_lock();
-                    }
-                    return true;
-                }
                 // Mouse click — focus the panel that was clicked.
                 // Do NOT return early for the terminal panel so the click also
                 // reaches the terminal handler to start a text selection.
@@ -305,13 +295,7 @@ impl Sheesh {
         let hints: Vec<(&str, &str)> = match &self.state {
             AppState::Listing => self.listing.key_hints(),
             AppState::Connected { focus, .. } => {
-                let lock_hint = self.terminal.as_ref().map(|t| {
-                    if t.is_locked() { ("F4", "unlock terminal") } else { ("F4", "lock terminal") }
-                });
                 let mut hints = vec![("F2", "switch panel"), ("F3", "send context")];
-                if let Some(h) = lock_hint {
-                    hints.push(h);
-                }
                 let panel_hints: Vec<(&str, &str)> = match focus {
                     ConnectedFocus::Terminal => self
                         .terminal
