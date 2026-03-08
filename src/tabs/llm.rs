@@ -1,4 +1,4 @@
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::{
@@ -13,17 +13,11 @@ use crate::{
     event::Action,
     llm::{ContentBlock, LLMEvent, LLMProvider, Message, RichMessage, Role, spawn_completion_rich},
     ssh::SSHConnection,
+    tabs::terminal::CONTEXT_LINES,
     ui::theme::Theme,
 };
 
 use super::Tab;
-
-/// Display prefix added to messages that include terminal context.
-const CONTEXT_DISPLAY_PREFIX: &str = "[terminal context shared]";
-/// Default question used when the user sends context without typing anything.
-const CONTEXT_DEFAULT_QUESTION: &str = "What's happening here?";
-/// API prompt template: context block + question.
-const CONTEXT_PROMPT_TEMPLATE: &str = "Terminal context:\n```\n{context}\n```\n\n{question}";
 
 /// (line_index, col) in the flattened history line buffer.
 type BufPos = (usize, usize);
@@ -71,6 +65,8 @@ pub struct LLMTab {
     connection: SSHConnection,
     /// Maps each visible chat screen row → (build_lines index, byte offset in that string).
     last_visual_row_map: Vec<(usize, usize)>,
+    /// Shared reference to the terminal's raw output log (for the read_terminal tool).
+    terminal_output: Option<Arc<Mutex<Vec<String>>>>,
 }
 
 impl LLMTab {
@@ -103,8 +99,13 @@ impl LLMTab {
             clipboard: arboard::Clipboard::new().ok(),
             connection,
             last_visual_row_map: vec![],
+            terminal_output: None,
             rich_history,
         }
+    }
+
+    pub fn set_terminal_output(&mut self, output: Arc<Mutex<Vec<String>>>) {
+        self.terminal_output = Some(output);
     }
 
     /// Poll the channel for completed LLM responses. Call this each render frame.
@@ -261,6 +262,20 @@ impl LLMTab {
                     if c.extra_options.is_empty() { "(none)".to_string() } else { c.extra_options.join(", ") },
                 )
             }
+            "read_terminal" => {
+                match &self.terminal_output {
+                    None => "Terminal output not available.".to_string(),
+                    Some(log) => {
+                        let log = log.lock().unwrap();
+                        if log.is_empty() {
+                            "No terminal output captured yet.".to_string()
+                        } else {
+                            let start = log.len().saturating_sub(CONTEXT_LINES);
+                            log[start..].join("")
+                        }
+                    }
+                }
+            }
             other => format!("Unknown local tool: {}", other),
         }
     }
@@ -292,34 +307,6 @@ impl LLMTab {
         }
         self.history.push(Message::user(&content));
         self.rich_history.push(RichMessage::user_text(&content));
-        self.waiting = true;
-        self.scroll_offset = 0;
-        self.status = "Waiting for response…".into();
-        spawn_completion_rich(
-            Arc::clone(&self.provider),
-            self.rich_history.clone(),
-            self.tx.clone(),
-        );
-    }
-
-    /// Prepend terminal context and send.
-    pub fn send_with_context(&mut self, context: String, question: String) {
-        if self.waiting {
-            return;
-        }
-
-        let question = if question.trim().is_empty() {
-            CONTEXT_DEFAULT_QUESTION.to_string()
-        } else {
-            question
-        };
-        let display = format!("{} {}", CONTEXT_DISPLAY_PREFIX, question);
-        let api_content = CONTEXT_PROMPT_TEMPLATE
-            .replace("{context}", &context)
-            .replace("{question}", &question);
-
-        self.history.push(Message::user(&display));
-        self.rich_history.push(RichMessage::user_text(api_content));
         self.waiting = true;
         self.scroll_offset = 0;
         self.status = "Waiting for response…".into();

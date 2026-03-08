@@ -144,6 +144,11 @@ fn all_tools() -> Value {
                 },
                 "required": []
             }
+        },
+        {
+            "name": "read_terminal",
+            "description": "Read the recent output from the user's terminal. Returns the last lines of captured terminal output. Use this to understand what is currently happening in the SSH session.",
+            "input_schema": { "type": "object", "properties": {}, "required": [] }
         }
     ])
 }
@@ -317,8 +322,8 @@ impl LLMProvider for AnthropicProvider {
 
             // Dispatch by tool name.
             match name.as_str() {
-                "system_information" => {
-                    debug!("[Anthropic] local tool: system_information");
+                "system_information" | "read_terminal" => {
+                    debug!("[Anthropic] local tool: {}", name);
                     return Ok(LLMEvent::LocalTool { id, name, input, assistant_blocks });
                 }
                 "run_command" => {
