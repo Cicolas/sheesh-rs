@@ -29,9 +29,6 @@ impl Message {
         Self { role: Role::Assistant, content: content.into() }
     }
 
-    pub fn system(content: impl Into<String>) -> Self {
-        Self { role: Role::System, content: content.into() }
-    }
 }
 
 // ── Rich content (Anthropic tool-use format) ──────────────────────────────────
@@ -106,7 +103,6 @@ pub enum LLMEvent {
     LocalTool {
         id: String,
         name: String,
-        input: serde_json::Value,
         assistant_blocks: Vec<ContentBlock>,
     },
     /// An error occurred.
@@ -230,20 +226,7 @@ pub fn build_provider(cfg: &LLMConfig) -> Arc<dyn LLMProvider> {
 
 // ── Background thread helpers ─────────────────────────────────────────────────
 
-pub fn spawn_completion(
-    provider: Arc<dyn LLMProvider>,
-    messages: Vec<Message>,
-    tx: Sender<LLMEvent>,
-) {
-    std::thread::spawn(move || {
-        match provider.complete(&messages) {
-            Ok(response) => { let _ = tx.send(LLMEvent::Response(response)); }
-            Err(e) => { let _ = tx.send(LLMEvent::Error(e.to_string())); }
-        }
-    });
-}
-
-/// Like `spawn_completion` but uses the rich API path with tool support.
+/// Spawns a background thread to get a rich LLM completion with tool support.
 pub fn spawn_completion_rich(
     provider: Arc<dyn LLMProvider>,
     messages: Vec<RichMessage>,

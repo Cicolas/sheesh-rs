@@ -143,16 +143,16 @@ impl Sheesh {
                 {
                     let col = me.column;
                     let row = me.row;
-                    if contains(self.terminal_area, col, row) {
-                        if let AppState::Connected { ref mut focus, .. } = self.state {
-                            *focus = ConnectedFocus::Terminal;
-                        }
+                    if contains(self.terminal_area, col, row)
+                        && let AppState::Connected { ref mut focus, .. } = self.state
+                    {
+                        *focus = ConnectedFocus::Terminal;
                         // fall through — let terminal handle_event receive the click
                     }
-                    if contains(self.llm_area, col, row) {
-                        if let AppState::Connected { ref mut focus, .. } = self.state {
-                            *focus = ConnectedFocus::LLM;
-                        }
+                    if contains(self.llm_area, col, row)
+                        && let AppState::Connected { ref mut focus, .. } = self.state
+                    {
+                        *focus = ConnectedFocus::LLM;
                         // fall through — let LLM handle_event receive the click for selection
                     }
                 }
@@ -367,26 +367,24 @@ fn main() -> anyhow::Result<()> {
                 terminal.draw(|f| app.draw(f))?;
 
                 // Forward captured terminal output to Claude once the deadline elapses.
-                if let Some(ref cap) = app.pending_capture {
-                    if std::time::Instant::now() >= cap.deadline {
-                        let snapshot = cap.snapshot;
-                        app.pending_capture = None;
-                        if let (Some(terminal), Some(llm)) =
-                            (&app.terminal, &mut app.llm)
-                        {
-                            if llm.awaiting_output_id.is_some() {
-                                let output = terminal.capture_since(snapshot);
-                                llm.resume_with_output(output);
-                            }
-                        }
+                if let Some(ref cap) = app.pending_capture
+                    && std::time::Instant::now() >= cap.deadline
+                {
+                    let snapshot = cap.snapshot;
+                    app.pending_capture = None;
+                    if let (Some(terminal), Some(llm)) = (&app.terminal, &mut app.llm)
+                        && llm.awaiting_output_id.is_some()
+                    {
+                        let output = terminal.capture_since(snapshot);
+                        llm.resume_with_output(output);
                     }
                 }
 
                 // Release the tool lock once the LLM finishes the tool-execution cycle.
-                if let (Some(terminal), Some(llm)) = (&mut app.terminal, &app.llm) {
-                    if terminal.tool_locked && !llm.is_executing_tool() && !llm.waiting {
-                        terminal.set_tool_locked(false);
-                    }
+                if let (Some(terminal), Some(llm)) = (&mut app.terminal, &app.llm)
+                    && terminal.tool_locked && !llm.is_executing_tool() && !llm.waiting
+                {
+                    terminal.set_tool_locked(false);
                 }
 
                 if poll(Duration::from_millis(5))? {

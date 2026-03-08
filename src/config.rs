@@ -60,10 +60,11 @@ pub fn load_connections(path: &Path) -> Result<Vec<SSHConnection>> {
                     pending_comment.clear();
                     continue;
                 }
-                let mut conn = SSHConnection::default();
-                conn.name = value;
-                conn.description = std::mem::take(&mut pending_comment);
-                current = Some(conn);
+                current = Some(SSHConnection {
+                    name: value,
+                    description: std::mem::take(&mut pending_comment),
+                    ..Default::default()
+                });
             }
             "HostName" | "hostname" => {
                 if let Some(ref mut c) = current {

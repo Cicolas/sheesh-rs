@@ -158,7 +158,7 @@ impl LLMTab {
                     }
                     self.scroll_offset = 0;
                 }
-                LLMEvent::LocalTool { id: api_id, name, input: _, assistant_blocks } => {
+                LLMEvent::LocalTool { id: api_id, name, assistant_blocks } => {
                     // Replace api id with a locally unique one.
                     let local_id = unique_tool_id();
                     let assistant_blocks: Vec<ContentBlock> = assistant_blocks
@@ -388,18 +388,11 @@ impl LLMTab {
         }
         let end_line = end.0.min(lines.len() - 1);
         let mut out = String::new();
-        for li in start.0..=end_line {
-            let line = &lines[li].0;
-            let from = if li == start.0 {
-                start.1.min(line.len())
-            } else {
-                0
-            };
-            let to = if li == end_line {
-                end.1.min(line.len())
-            } else {
-                line.len()
-            };
+        for (i, entry) in lines[start.0..=end_line].iter().enumerate() {
+            let li = start.0 + i;
+            let line = &entry.0;
+            let from = if li == start.0 { start.1.min(line.len()) } else { 0 };
+            let to = if li == end_line { end.1.min(line.len()) } else { line.len() };
             out.push_str(&line[from..to]);
             if li < end_line {
                 out.push('\n');
@@ -414,19 +407,15 @@ impl LLMTab {
     }
 
     fn copy_selection(&mut self) {
-        if let Some(text) = self.selected_text() {
-            if let Some(ref mut cb) = self.clipboard {
-                let _ = cb.set_text(text);
-            }
+        if let Some(text) = self.selected_text()
+            && let Some(ref mut cb) = self.clipboard
+        {
+            let _ = cb.set_text(text);
         }
     }
 }
 
 impl Tab for LLMTab {
-    fn title(&self) -> &str {
-        "LLM"
-    }
-
     fn key_hints(&self) -> Vec<(&str, &str)> {
         let mut hints = vec![
             ("enter", "send"),
@@ -483,10 +472,10 @@ impl Tab for LLMTab {
                     return Action::None;
                 }
                 if *code == KeyCode::F(4) {
-                    if let Some(idx) = self.suggestion_idx {
-                        if let Some(cmd) = self.suggestions.get(idx) {
-                            return Action::SendToTerminal(cmd.clone());
-                        }
+                    if let Some(idx) = self.suggestion_idx
+                        && let Some(cmd) = self.suggestions.get(idx)
+                    {
+                        return Action::SendToTerminal(cmd.clone());
                     }
                     return Action::None;
                 }
@@ -552,17 +541,17 @@ impl Tab for LLMTab {
                             self.screen_to_buf(me.column, me.row).map(|pos| (pos, pos));
                     }
                     MouseEventKind::Drag(MouseButton::Left) => {
-                        if let Some((anchor, _)) = self.selection {
-                            if let Some(cur) = self.screen_to_buf(me.column, me.row) {
-                                self.selection = Some((anchor, cur));
-                            }
+                        if let Some((anchor, _)) = self.selection
+                            && let Some(cur) = self.screen_to_buf(me.column, me.row)
+                        {
+                            self.selection = Some((anchor, cur));
                         }
                     }
                     MouseEventKind::Up(MouseButton::Left) => {
-                        if let Some((a, b)) = self.selection {
-                            if a == b {
-                                self.selection = None;
-                            }
+                        if let Some((a, b)) = self.selection
+                            && a == b
+                        {
+                            self.selection = None;
                         }
                     }
                     MouseEventKind::ScrollUp => {
@@ -884,7 +873,7 @@ fn wrapped_line_count(text: &str, width: usize) -> usize {
     text.lines()
         .map(|l| {
             let chars = l.chars().count();
-            if chars == 0 { 1 } else { (chars + width - 1) / width }
+            if chars == 0 { 1 } else { chars.div_ceil(width) }
         })
         .sum::<usize>()
         .max(1)
@@ -1121,31 +1110,31 @@ fn parse_inline_md(text: &str) -> Vec<Span<'static>> {
             }
             // *italic* (single star)
             '*' => {
-                if let Some(end) = find_char_from(&chars, i + 1, '*') {
-                    if end > i + 1 {
-                        flush_buf(&mut buf, &mut spans);
-                        spans.push(Span::styled(
-                            chars[i + 1..end].iter().collect::<String>(),
-                            Style::default().add_modifier(Modifier::ITALIC),
-                        ));
-                        i = end + 1;
-                        continue;
-                    }
+                if let Some(end) = find_char_from(&chars, i + 1, '*')
+                    && end > i + 1
+                {
+                    flush_buf(&mut buf, &mut spans);
+                    spans.push(Span::styled(
+                        chars[i + 1..end].iter().collect::<String>(),
+                        Style::default().add_modifier(Modifier::ITALIC),
+                    ));
+                    i = end + 1;
+                    continue;
                 }
                 buf.push('*');
             }
             // _italic_ (single underscore)
             '_' => {
-                if let Some(end) = find_char_from(&chars, i + 1, '_') {
-                    if end > i + 1 {
-                        flush_buf(&mut buf, &mut spans);
-                        spans.push(Span::styled(
-                            chars[i + 1..end].iter().collect::<String>(),
-                            Style::default().add_modifier(Modifier::ITALIC),
-                        ));
-                        i = end + 1;
-                        continue;
-                    }
+                if let Some(end) = find_char_from(&chars, i + 1, '_')
+                    && end > i + 1
+                {
+                    flush_buf(&mut buf, &mut spans);
+                    spans.push(Span::styled(
+                        chars[i + 1..end].iter().collect::<String>(),
+                        Style::default().add_modifier(Modifier::ITALIC),
+                    ));
+                    i = end + 1;
+                    continue;
                 }
                 buf.push('_');
             }
@@ -1186,12 +1175,7 @@ fn find_seq(chars: &[char], from: usize, seq: &[char]) -> Option<usize> {
     if sl == 0 {
         return Some(from);
     }
-    for i in from..=chars.len().saturating_sub(sl) {
-        if chars[i..i + sl] == *seq {
-            return Some(i);
-        }
-    }
-    None
+    (from..=chars.len().saturating_sub(sl)).find(|&i| chars[i..i + sl] == *seq)
 }
 
 /// Find the first occurrence of `target` in `chars` at or after `from`.

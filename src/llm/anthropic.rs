@@ -167,10 +167,10 @@ fn rich_to_json(m: &RichMessage) -> Value {
     };
 
     // If there's a single Text block we can use the shorthand string form.
-    if m.content.len() == 1 {
-        if let ContentBlock::Text { text } = &m.content[0] {
-            return json!({ "role": role, "content": text });
-        }
+    if m.content.len() == 1
+        && let ContentBlock::Text { text } = &m.content[0]
+    {
+        return json!({ "role": role, "content": text });
     }
 
     let blocks: Vec<Value> = m
@@ -298,10 +298,10 @@ impl LLMProvider for AnthropicProvider {
             for block in &content {
                 match block["type"].as_str() {
                     Some("text") => {
-                        if let Some(text) = block["text"].as_str() {
-                            if !text.is_empty() {
-                                assistant_blocks.push(ContentBlock::Text { text: text.to_string() });
-                            }
+                        if let Some(text) = block["text"].as_str()
+                            && !text.is_empty()
+                        {
+                            assistant_blocks.push(ContentBlock::Text { text: text.to_string() });
                         }
                     }
                     Some("tool_use") => {
@@ -324,7 +324,7 @@ impl LLMProvider for AnthropicProvider {
             match name.as_str() {
                 "system_information" | "read_terminal" => {
                     debug!("[Anthropic] local tool: {}", name);
-                    return Ok(LLMEvent::LocalTool { id, name, input, assistant_blocks });
+                    return Ok(LLMEvent::LocalTool { id, name, assistant_blocks });
                 }
                 "run_command" => {
                     let command = input["command"]
