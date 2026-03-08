@@ -358,7 +358,6 @@ impl TermEmulator {
                 EraseInLine::EraseLine => {
                     self.screen[cr] = empty_row(cols);
                 }
-                _ => {}
             },
             Edit::DeleteLine(n) => {
                 let saved_top = self.scroll_top;
@@ -558,6 +557,10 @@ impl TerminalTab {
         *self.alive.lock().unwrap()
     }
 
+    pub fn output_log_arc(&self) -> Arc<Mutex<Vec<String>>> {
+        Arc::clone(&self.output_log)
+    }
+
     pub fn line_count(&self) -> usize {
         self.output_log.lock().unwrap().len()
     }
@@ -565,19 +568,6 @@ impl TerminalTab {
     pub fn capture_since(&self, from: usize) -> String {
         let log = self.output_log.lock().unwrap();
         log[from.min(log.len())..].join("")
-    }
-
-    pub fn visible_text(&self, last_n: usize) -> String {
-        let emu = self.emulator.lock().unwrap();
-        let start = emu.rows.saturating_sub(last_n);
-        emu.screen[start..emu.rows.min(emu.screen.len())]
-            .iter()
-            .map(|row| {
-                let line: String = row.iter().map(|c| c.ch).collect();
-                line.trim_end().to_string()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
     }
 
     pub fn send_string(&mut self, s: &str) {
@@ -605,15 +595,6 @@ impl TerminalTab {
 
     pub fn set_tool_locked(&mut self, locked: bool) {
         self.tool_locked = locked;
-    }
-
-    pub fn toggle_user_lock(&mut self) {
-        if self.is_locked() {
-            self.user_locked = false;
-            self.tool_locked = false;
-        } else {
-            self.user_locked = true;
-        }
     }
 
     fn selection_range(&self) -> Option<(SelPos, SelPos)> {
@@ -681,27 +662,23 @@ impl TerminalTab {
     }
 
     fn copy_selection(&mut self) {
-        if let Some(text) = self.selected_text() {
-            if let Some(ref mut cb) = self.clipboard {
-                let _ = cb.set_text(text);
-            }
+        if let Some(text) = self.selected_text()
+            && let Some(ref mut cb) = self.clipboard
+        {
+            let _ = cb.set_text(text);
         }
     }
 
     fn paste_from_clipboard(&mut self) {
-        if let Some(ref mut cb) = self.clipboard {
-            if let Ok(text) = cb.get_text() {
-                self.send_bytes(text.as_bytes());
-            }
+        if let Some(ref mut cb) = self.clipboard
+            && let Ok(text) = cb.get_text()
+        {
+            self.send_bytes(text.as_bytes());
         }
     }
 }
 
 impl Tab for TerminalTab {
-    fn title(&self) -> &str {
-        "Terminal"
-    }
-
     fn key_hints(&self) -> Vec<(&str, &str)> {
         vec![("ctrl+d", "disconnect")]
     }
@@ -807,21 +784,21 @@ impl Tab for TerminalTab {
                         }
                     }
                     MouseEventKind::Drag(MouseButton::Left) => {
-                        if let Some((anchor, _)) = self.selection {
-                            if me.row >= inner.y && me.column >= inner.x {
-                                let sc = me.column - inner.x;
-                                let sr = me.row - inner.y;
-                                if let Some(cur) = self.screen_to_sel_pos(sc, sr) {
-                                    self.selection = Some((anchor, cur));
-                                }
+                        if let Some((anchor, _)) = self.selection
+                            && me.row >= inner.y && me.column >= inner.x
+                        {
+                            let sc = me.column - inner.x;
+                            let sr = me.row - inner.y;
+                            if let Some(cur) = self.screen_to_sel_pos(sc, sr) {
+                                self.selection = Some((anchor, cur));
                             }
                         }
                     }
                     MouseEventKind::Up(MouseButton::Left) => {
-                        if let Some((a, b)) = self.selection {
-                            if a == b {
-                                self.selection = None;
-                            }
+                        if let Some((a, b)) = self.selection
+                            && a == b
+                        {
+                            self.selection = None;
                         }
                     }
                     MouseEventKind::ScrollUp => self.scroll_up(),
@@ -937,10 +914,10 @@ impl Tab for TerminalTab {
 
         frame.render_widget(Paragraph::new(display), inner);
 
-        if focused {
-            if let Some((cx, cy)) = cursor_screen_pos {
-                frame.set_cursor_position((cx, cy));
-            }
+        if focused
+            && let Some((cx, cy)) = cursor_screen_pos
+        {
+            frame.set_cursor_position((cx, cy));
         }
     }
 }

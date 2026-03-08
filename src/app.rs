@@ -2,6 +2,7 @@
 use crate::ssh::SSHConnection;
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::upper_case_acronyms)]
 pub enum ConnectedFocus {
     Terminal,
     LLM,

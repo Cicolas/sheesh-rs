@@ -29,9 +29,6 @@ impl Message {
         Self { role: Role::Assistant, content: content.into() }
     }
 
-    pub fn system(content: impl Into<String>) -> Self {
-        Self { role: Role::System, content: content.into() }
-    }
 }
 
 // ── Rich content (Anthropic tool-use format) ──────────────────────────────────
@@ -106,7 +103,6 @@ pub enum LLMEvent {
     LocalTool {
         id: String,
         name: String,
-        input: serde_json::Value,
         assistant_blocks: Vec<ContentBlock>,
     },
     /// An error occurred.
@@ -154,10 +150,16 @@ pub trait LLMProvider: Send + Sync {
 pub const DEFAULT_SYSTEM_PROMPT: &str = "\
 You are Sheesh, an expert SSH and Linux assistant embedded in a terminal manager. \
 You help users understand and manage their remote SSH sessions. \
-When the user shares terminal output, analyse it and provide clear, actionable guidance. \
 Prefer concise answers; use shell code blocks for any commands you suggest. \
-You can run commands directly on the user's remote session via the run_command tool — \
-always explain what a command does before proposing to run it.";
+You have the following tools available:\n\
+- read_terminal: Read recent output from the user's terminal. \
+  Call this proactively whenever the user asks about what is on the screen, \
+  what is happening, or any question that requires knowing the current terminal state. \
+  Do NOT ask the user to share output — just call the tool.\n\
+- run_command: Execute a shell command on the remote SSH session. \
+  Always explain what a command does before proposing to run it.\n\
+- system_information: Get SSH connection details for the current session.\n\
+- read_file, list_dir, make_dir, touch_file: File operations on the remote host.";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -224,20 +226,7 @@ pub fn build_provider(cfg: &LLMConfig) -> Arc<dyn LLMProvider> {
 
 // ── Background thread helpers ─────────────────────────────────────────────────
 
-pub fn spawn_completion(
-    provider: Arc<dyn LLMProvider>,
-    messages: Vec<Message>,
-    tx: Sender<LLMEvent>,
-) {
-    std::thread::spawn(move || {
-        match provider.complete(&messages) {
-            Ok(response) => { let _ = tx.send(LLMEvent::Response(response)); }
-            Err(e) => { let _ = tx.send(LLMEvent::Error(e.to_string())); }
-        }
-    });
-}
-
-/// Like `spawn_completion` but uses the rich API path with tool support.
+/// Spawns a background thread to get a rich LLM completion with tool support.
 pub fn spawn_completion_rich(
     provider: Arc<dyn LLMProvider>,
     messages: Vec<RichMessage>,

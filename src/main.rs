@@ -26,7 +26,7 @@ use app::{AppState, ConnectedFocus};
 use config::{load_connections, save_connections, ssh_config_path};
 use event::Action;
 use llm::{LLMConfig, build_provider};
-use tabs::{Tab, listing::ListingTab, llm::LLMTab, terminal::{CONTEXT_LINES, TerminalTab}};
+use tabs::{Tab, listing::ListingTab, llm::LLMTab, terminal::TerminalTab};
 use ui::{keybindings::render_keybindings, theme::Theme};
 
 /// Captures terminal output produced by a tool-call command and forwards it
@@ -90,8 +90,11 @@ impl Sheesh {
         };
 
         let provider = build_provider(&self.llm_config);
+        let output_log = terminal.output_log_arc();
         self.terminal = Some(terminal);
-        self.llm = Some(LLMTab::new(provider, self.llm_config.system_prompt.clone(), conn.clone()));
+        let mut llm = LLMTab::new(provider, self.llm_config.system_prompt.clone(), conn.clone());
+        llm.set_terminal_output(output_log);
+        self.llm = Some(llm);
         self.state = AppState::Connected {
             connection_name: name,
             focus: ConnectedFocus::Terminal,
@@ -110,14 +113,6 @@ impl Sheesh {
                 ConnectedFocus::Terminal => ConnectedFocus::LLM,
                 ConnectedFocus::LLM => ConnectedFocus::Terminal,
             };
-        }
-    }
-
-    fn send_context_to_llm(&mut self) {
-        if let (Some(terminal), Some(llm)) = (&self.terminal, &mut self.llm) {
-            let ctx = terminal.visible_text(CONTEXT_LINES);
-            let question = std::mem::take(&mut llm.input);
-            llm.send_with_context(ctx, question);
         }
     }
 
@@ -140,14 +135,6 @@ impl Sheesh {
                     self.cycle_focus();
                     return true;
                 }
-                // F3 — send terminal context to LLM (stay on current panel)
-                crossterm::event::Event::Key(KeyEvent {
-                    code: KeyCode::F(3),
-                    ..
-                }) => {
-                    self.send_context_to_llm();
-                    return true;
-                }
                 // Mouse click — focus the panel that was clicked.
                 // Do NOT return early for the terminal panel so the click also
                 // reaches the terminal handler to start a text selection.
@@ -156,16 +143,16 @@ impl Sheesh {
                 {
                     let col = me.column;
                     let row = me.row;
-                    if contains(self.terminal_area, col, row) {
-                        if let AppState::Connected { ref mut focus, .. } = self.state {
-                            *focus = ConnectedFocus::Terminal;
-                        }
+                    if contains(self.terminal_area, col, row)
+                        && let AppState::Connected { ref mut focus, .. } = self.state
+                    {
+                        *focus = ConnectedFocus::Terminal;
                         // fall through — let terminal handle_event receive the click
                     }
-                    if contains(self.llm_area, col, row) {
-                        if let AppState::Connected { ref mut focus, .. } = self.state {
-                            *focus = ConnectedFocus::LLM;
-                        }
+                    if contains(self.llm_area, col, row)
+                        && let AppState::Connected { ref mut focus, .. } = self.state
+                    {
+                        *focus = ConnectedFocus::LLM;
                         // fall through — let LLM handle_event receive the click for selection
                     }
                 }
@@ -295,7 +282,7 @@ impl Sheesh {
         let hints: Vec<(&str, &str)> = match &self.state {
             AppState::Listing => self.listing.key_hints(),
             AppState::Connected { focus, .. } => {
-                let mut hints = vec![("F2", "switch panel"), ("F3", "send context")];
+                let mut hints = vec![("F2", "switch panel")];
                 let panel_hints: Vec<(&str, &str)> = match focus {
                     ConnectedFocus::Terminal => self
                         .terminal
@@ -380,26 +367,24 @@ fn main() -> anyhow::Result<()> {
                 terminal.draw(|f| app.draw(f))?;
 
                 // Forward captured terminal output to Claude once the deadline elapses.
-                if let Some(ref cap) = app.pending_capture {
-                    if std::time::Instant::now() >= cap.deadline {
-                        let snapshot = cap.snapshot;
-                        app.pending_capture = None;
-                        if let (Some(terminal), Some(llm)) =
-                            (&app.terminal, &mut app.llm)
-                        {
-                            if llm.awaiting_output_id.is_some() {
-                                let output = terminal.capture_since(snapshot);
-                                llm.resume_with_output(output);
-                            }
-                        }
+                if let Some(ref cap) = app.pending_capture
+                    && std::time::Instant::now() >= cap.deadline
+                {
+                    let snapshot = cap.snapshot;
+                    app.pending_capture = None;
+                    if let (Some(terminal), Some(llm)) = (&app.terminal, &mut app.llm)
+                        && llm.awaiting_output_id.is_some()
+                    {
+                        let output = terminal.capture_since(snapshot);
+                        llm.resume_with_output(output);
                     }
                 }
 
                 // Release the tool lock once the LLM finishes the tool-execution cycle.
-                if let (Some(terminal), Some(llm)) = (&mut app.terminal, &app.llm) {
-                    if terminal.tool_locked && !llm.is_executing_tool() && !llm.waiting {
-                        terminal.set_tool_locked(false);
-                    }
+                if let (Some(terminal), Some(llm)) = (&mut app.terminal, &app.llm)
+                    && terminal.tool_locked && !llm.is_executing_tool() && !llm.waiting
+                {
+                    terminal.set_tool_locked(false);
                 }
 
                 if poll(Duration::from_millis(5))? {

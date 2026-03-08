@@ -1,4 +1,4 @@
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::{
@@ -13,17 +13,11 @@ use crate::{
     event::Action,
     llm::{ContentBlock, LLMEvent, LLMProvider, Message, RichMessage, Role, spawn_completion_rich},
     ssh::SSHConnection,
+    tabs::terminal::CONTEXT_LINES,
     ui::theme::Theme,
 };
 
 use super::Tab;
-
-/// Display prefix added to messages that include terminal context.
-const CONTEXT_DISPLAY_PREFIX: &str = "[terminal context shared]";
-/// Default question used when the user sends context without typing anything.
-const CONTEXT_DEFAULT_QUESTION: &str = "What's happening here?";
-/// API prompt template: context block + question.
-const CONTEXT_PROMPT_TEMPLATE: &str = "Terminal context:\n```\n{context}\n```\n\n{question}";
 
 /// (line_index, col) in the flattened history line buffer.
 type BufPos = (usize, usize);
@@ -71,6 +65,8 @@ pub struct LLMTab {
     connection: SSHConnection,
     /// Maps each visible chat screen row → (build_lines index, byte offset in that string).
     last_visual_row_map: Vec<(usize, usize)>,
+    /// Shared reference to the terminal's raw output log (for the read_terminal tool).
+    terminal_output: Option<Arc<Mutex<Vec<String>>>>,
 }
 
 impl LLMTab {
@@ -103,8 +99,13 @@ impl LLMTab {
             clipboard: arboard::Clipboard::new().ok(),
             connection,
             last_visual_row_map: vec![],
+            terminal_output: None,
             rich_history,
         }
+    }
+
+    pub fn set_terminal_output(&mut self, output: Arc<Mutex<Vec<String>>>) {
+        self.terminal_output = Some(output);
     }
 
     /// Poll the channel for completed LLM responses. Call this each render frame.
@@ -157,7 +158,7 @@ impl LLMTab {
                     }
                     self.scroll_offset = 0;
                 }
-                LLMEvent::LocalTool { id: api_id, name, input: _, assistant_blocks } => {
+                LLMEvent::LocalTool { id: api_id, name, assistant_blocks } => {
                     // Replace api id with a locally unique one.
                     let local_id = unique_tool_id();
                     let assistant_blocks: Vec<ContentBlock> = assistant_blocks
@@ -261,6 +262,20 @@ impl LLMTab {
                     if c.extra_options.is_empty() { "(none)".to_string() } else { c.extra_options.join(", ") },
                 )
             }
+            "read_terminal" => {
+                match &self.terminal_output {
+                    None => "Terminal output not available.".to_string(),
+                    Some(log) => {
+                        let log = log.lock().unwrap();
+                        if log.is_empty() {
+                            "No terminal output captured yet.".to_string()
+                        } else {
+                            let start = log.len().saturating_sub(CONTEXT_LINES);
+                            log[start..].join("")
+                        }
+                    }
+                }
+            }
             other => format!("Unknown local tool: {}", other),
         }
     }
@@ -292,34 +307,6 @@ impl LLMTab {
         }
         self.history.push(Message::user(&content));
         self.rich_history.push(RichMessage::user_text(&content));
-        self.waiting = true;
-        self.scroll_offset = 0;
-        self.status = "Waiting for response…".into();
-        spawn_completion_rich(
-            Arc::clone(&self.provider),
-            self.rich_history.clone(),
-            self.tx.clone(),
-        );
-    }
-
-    /// Prepend terminal context and send.
-    pub fn send_with_context(&mut self, context: String, question: String) {
-        if self.waiting {
-            return;
-        }
-
-        let question = if question.trim().is_empty() {
-            CONTEXT_DEFAULT_QUESTION.to_string()
-        } else {
-            question
-        };
-        let display = format!("{} {}", CONTEXT_DISPLAY_PREFIX, question);
-        let api_content = CONTEXT_PROMPT_TEMPLATE
-            .replace("{context}", &context)
-            .replace("{question}", &question);
-
-        self.history.push(Message::user(&display));
-        self.rich_history.push(RichMessage::user_text(api_content));
         self.waiting = true;
         self.scroll_offset = 0;
         self.status = "Waiting for response…".into();
@@ -401,18 +388,11 @@ impl LLMTab {
         }
         let end_line = end.0.min(lines.len() - 1);
         let mut out = String::new();
-        for li in start.0..=end_line {
-            let line = &lines[li].0;
-            let from = if li == start.0 {
-                start.1.min(line.len())
-            } else {
-                0
-            };
-            let to = if li == end_line {
-                end.1.min(line.len())
-            } else {
-                line.len()
-            };
+        for (i, entry) in lines[start.0..=end_line].iter().enumerate() {
+            let li = start.0 + i;
+            let line = &entry.0;
+            let from = if li == start.0 { start.1.min(line.len()) } else { 0 };
+            let to = if li == end_line { end.1.min(line.len()) } else { line.len() };
             out.push_str(&line[from..to]);
             if li < end_line {
                 out.push('\n');
@@ -427,19 +407,15 @@ impl LLMTab {
     }
 
     fn copy_selection(&mut self) {
-        if let Some(text) = self.selected_text() {
-            if let Some(ref mut cb) = self.clipboard {
-                let _ = cb.set_text(text);
-            }
+        if let Some(text) = self.selected_text()
+            && let Some(ref mut cb) = self.clipboard
+        {
+            let _ = cb.set_text(text);
         }
     }
 }
 
 impl Tab for LLMTab {
-    fn title(&self) -> &str {
-        "LLM"
-    }
-
     fn key_hints(&self) -> Vec<(&str, &str)> {
         let mut hints = vec![
             ("enter", "send"),
@@ -496,10 +472,10 @@ impl Tab for LLMTab {
                     return Action::None;
                 }
                 if *code == KeyCode::F(4) {
-                    if let Some(idx) = self.suggestion_idx {
-                        if let Some(cmd) = self.suggestions.get(idx) {
-                            return Action::SendToTerminal(cmd.clone());
-                        }
+                    if let Some(idx) = self.suggestion_idx
+                        && let Some(cmd) = self.suggestions.get(idx)
+                    {
+                        return Action::SendToTerminal(cmd.clone());
                     }
                     return Action::None;
                 }
@@ -565,17 +541,17 @@ impl Tab for LLMTab {
                             self.screen_to_buf(me.column, me.row).map(|pos| (pos, pos));
                     }
                     MouseEventKind::Drag(MouseButton::Left) => {
-                        if let Some((anchor, _)) = self.selection {
-                            if let Some(cur) = self.screen_to_buf(me.column, me.row) {
-                                self.selection = Some((anchor, cur));
-                            }
+                        if let Some((anchor, _)) = self.selection
+                            && let Some(cur) = self.screen_to_buf(me.column, me.row)
+                        {
+                            self.selection = Some((anchor, cur));
                         }
                     }
                     MouseEventKind::Up(MouseButton::Left) => {
-                        if let Some((a, b)) = self.selection {
-                            if a == b {
-                                self.selection = None;
-                            }
+                        if let Some((a, b)) = self.selection
+                            && a == b
+                        {
+                            self.selection = None;
                         }
                     }
                     MouseEventKind::ScrollUp => {
@@ -897,7 +873,7 @@ fn wrapped_line_count(text: &str, width: usize) -> usize {
     text.lines()
         .map(|l| {
             let chars = l.chars().count();
-            if chars == 0 { 1 } else { (chars + width - 1) / width }
+            if chars == 0 { 1 } else { chars.div_ceil(width) }
         })
         .sum::<usize>()
         .max(1)
@@ -1134,31 +1110,31 @@ fn parse_inline_md(text: &str) -> Vec<Span<'static>> {
             }
             // *italic* (single star)
             '*' => {
-                if let Some(end) = find_char_from(&chars, i + 1, '*') {
-                    if end > i + 1 {
-                        flush_buf(&mut buf, &mut spans);
-                        spans.push(Span::styled(
-                            chars[i + 1..end].iter().collect::<String>(),
-                            Style::default().add_modifier(Modifier::ITALIC),
-                        ));
-                        i = end + 1;
-                        continue;
-                    }
+                if let Some(end) = find_char_from(&chars, i + 1, '*')
+                    && end > i + 1
+                {
+                    flush_buf(&mut buf, &mut spans);
+                    spans.push(Span::styled(
+                        chars[i + 1..end].iter().collect::<String>(),
+                        Style::default().add_modifier(Modifier::ITALIC),
+                    ));
+                    i = end + 1;
+                    continue;
                 }
                 buf.push('*');
             }
             // _italic_ (single underscore)
             '_' => {
-                if let Some(end) = find_char_from(&chars, i + 1, '_') {
-                    if end > i + 1 {
-                        flush_buf(&mut buf, &mut spans);
-                        spans.push(Span::styled(
-                            chars[i + 1..end].iter().collect::<String>(),
-                            Style::default().add_modifier(Modifier::ITALIC),
-                        ));
-                        i = end + 1;
-                        continue;
-                    }
+                if let Some(end) = find_char_from(&chars, i + 1, '_')
+                    && end > i + 1
+                {
+                    flush_buf(&mut buf, &mut spans);
+                    spans.push(Span::styled(
+                        chars[i + 1..end].iter().collect::<String>(),
+                        Style::default().add_modifier(Modifier::ITALIC),
+                    ));
+                    i = end + 1;
+                    continue;
                 }
                 buf.push('_');
             }
@@ -1199,12 +1175,7 @@ fn find_seq(chars: &[char], from: usize, seq: &[char]) -> Option<usize> {
     if sl == 0 {
         return Some(from);
     }
-    for i in from..=chars.len().saturating_sub(sl) {
-        if chars[i..i + sl] == *seq {
-            return Some(i);
-        }
-    }
-    None
+    (from..=chars.len().saturating_sub(sl)).find(|&i| chars[i..i + sl] == *seq)
 }
 
 /// Find the first occurrence of `target` in `chars` at or after `from`.

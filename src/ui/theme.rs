@@ -21,11 +21,6 @@ impl Theme {
         Style::default().fg(Color::Green)
     }
 
-    /// Selected in navigate mode: highlighted but not capturing input.
-    pub fn navigate_border() -> Style {
-        Style::default().fg(Color::Yellow)
-    }
-
     pub fn normal_border() -> Style {
         Style::default().fg(Color::DarkGray)
     }

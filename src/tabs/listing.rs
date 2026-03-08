@@ -196,15 +196,15 @@ impl ListingTab {
 
     fn do_delete(&mut self) {
         let indices = self.filtered_indices();
-        if let Some(sel) = self.list_state.selected() {
-            if let Some(&idx) = indices.get(sel) {
-                self.connections.remove(idx);
-                let new_len = self.filtered_indices().len();
-                if new_len == 0 {
-                    self.list_state.select(None);
-                } else {
-                    self.list_state.select(Some(sel.min(new_len - 1)));
-                }
+        if let Some(sel) = self.list_state.selected()
+            && let Some(&idx) = indices.get(sel)
+        {
+            self.connections.remove(idx);
+            let new_len = self.filtered_indices().len();
+            if new_len == 0 {
+                self.list_state.select(None);
+            } else {
+                self.list_state.select(Some(sel.min(new_len - 1)));
             }
         }
         self.mode = ListingMode::Browse;
@@ -225,10 +225,6 @@ impl ListingTab {
 }
 
 impl Tab for ListingTab {
-    fn title(&self) -> &str {
-        "Connections"
-    }
-
     fn key_hints(&self) -> Vec<(&str, &str)> {
         match self.mode {
             ListingMode::Browse => vec![
