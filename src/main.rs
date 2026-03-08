@@ -26,7 +26,7 @@ use app::{AppState, ConnectedFocus};
 use config::{load_connections, save_connections, ssh_config_path};
 use event::Action;
 use llm::{LLMConfig, build_provider};
-use tabs::{Tab, listing::ListingTab, llm::LLMTab, terminal::{CONTEXT_LINES, TerminalTab}};
+use tabs::{Tab, listing::ListingTab, llm::LLMTab, terminal::TerminalTab};
 use ui::{keybindings::render_keybindings, theme::Theme};
 
 /// Captures terminal output produced by a tool-call command and forwards it
@@ -90,8 +90,11 @@ impl Sheesh {
         };
 
         let provider = build_provider(&self.llm_config);
+        let output_log = terminal.output_log_arc();
         self.terminal = Some(terminal);
-        self.llm = Some(LLMTab::new(provider, self.llm_config.system_prompt.clone(), conn.clone()));
+        let mut llm = LLMTab::new(provider, self.llm_config.system_prompt.clone(), conn.clone());
+        llm.set_terminal_output(output_log);
+        self.llm = Some(llm);
         self.state = AppState::Connected {
             connection_name: name,
             focus: ConnectedFocus::Terminal,
@@ -113,14 +116,6 @@ impl Sheesh {
         }
     }
 
-    fn send_context_to_llm(&mut self) {
-        if let (Some(terminal), Some(llm)) = (&self.terminal, &mut self.llm) {
-            let ctx = terminal.visible_text(CONTEXT_LINES);
-            let question = std::mem::take(&mut llm.input);
-            llm.send_with_context(ctx, question);
-        }
-    }
-
     fn handle_event(&mut self, event: &crossterm::event::Event) -> bool {
         use crossterm::event::{KeyCode, KeyEvent};
 
@@ -138,14 +133,6 @@ impl Sheesh {
                     ..
                 }) => {
                     self.cycle_focus();
-                    return true;
-                }
-                // F3 — send terminal context to LLM (stay on current panel)
-                crossterm::event::Event::Key(KeyEvent {
-                    code: KeyCode::F(3),
-                    ..
-                }) => {
-                    self.send_context_to_llm();
                     return true;
                 }
                 // Mouse click — focus the panel that was clicked.
@@ -295,7 +282,7 @@ impl Sheesh {
         let hints: Vec<(&str, &str)> = match &self.state {
             AppState::Listing => self.listing.key_hints(),
             AppState::Connected { focus, .. } => {
-                let mut hints = vec![("F2", "switch panel"), ("F3", "send context")];
+                let mut hints = vec![("F2", "switch panel")];
                 let panel_hints: Vec<(&str, &str)> = match focus {
                     ConnectedFocus::Terminal => self
                         .terminal

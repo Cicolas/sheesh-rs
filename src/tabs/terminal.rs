@@ -558,6 +558,10 @@ impl TerminalTab {
         *self.alive.lock().unwrap()
     }
 
+    pub fn output_log_arc(&self) -> Arc<Mutex<Vec<String>>> {
+        Arc::clone(&self.output_log)
+    }
+
     pub fn line_count(&self) -> usize {
         self.output_log.lock().unwrap().len()
     }
