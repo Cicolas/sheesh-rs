@@ -1,6 +1,10 @@
 name: Release AppImage
 
 on:
+  pull_request:
+    types: [closed]
+    branches:
+      - main
   push:
     tags:
       - "v*"
@@ -10,10 +14,31 @@ permissions:
 
 jobs:
   build-appimage:
+    if: >
+      (github.event_name == 'push') ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.merged == true &&
+       startsWith(github.event.pull_request.head.ref, 'release/'))
     runs-on: ubuntu-22.04
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Resolve version tag
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*= *"\(.*\)"/\1/')
+            echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create and push tag
+        if: github.event_name == 'pull_request'
+        run: |
+          git tag "${{ steps.version.outputs.tag }}"
+          git push origin "${{ steps.version.outputs.tag }}"
 
       - name: Install system dependencies
         run: |
@@ -79,11 +104,11 @@ jobs:
         env:
           ARCH: x86_64
         run: |
-          # appimagetool needs FUSE; use extract-and-run workaround in CI
-          appimagetool --appimage-extract-and-run AppDir sheesh-rs-${{ github.ref_name }}-x86_64.AppImage
+          appimagetool --appimage-extract-and-run AppDir sheesh-rs-${{ steps.version.outputs.tag }}-x86_64.AppImage
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: sheesh-rs-${{ github.ref_name }}-x86_64.AppImage
+          tag_name: ${{ steps.version.outputs.tag }}
+          files: sheesh-rs-${{ steps.version.outputs.tag }}-x86_64.AppImage
           generate_release_notes: true
