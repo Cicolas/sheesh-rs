@@ -401,11 +401,11 @@ fn main() -> anyhow::Result<()> {
                 };
                 if should_fire {
                     let snapshot = app.pending_capture.take().unwrap().snapshot;
-                    if let (Some(terminal), Some(llm)) = (&app.terminal, &mut app.llm) {
-                        if llm.awaiting_output_id.is_some() {
-                            let output = terminal.capture_since(snapshot);
-                            llm.resume_with_output(output);
-                        }
+                    if let (Some(terminal), Some(llm)) = (&app.terminal, &mut app.llm)
+                        && llm.awaiting_output_id.is_some()
+                    {
+                        let output = terminal.capture_since(snapshot);
+                        llm.resume_with_output(output);
                     }
                 }
 
