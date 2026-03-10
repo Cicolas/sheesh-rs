@@ -2214,7 +2214,7 @@ dependencies = [
 
 [[package]]
 name = "sheesh-rs"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "ansi_term",
  "anyhow",
