@@ -246,17 +246,6 @@ impl LLMTab {
         self.pending_tool_call.is_some() || self.awaiting_output_id.is_some()
     }
 
-    /// Cancel any in-progress tool call and return to an idle state so the
-    /// user can type a new message.
-    pub fn cancel_tool_call(&mut self) {
-        self.pending_tool_call = None;
-        self.awaiting_output_id = None;
-        self.waiting = false;
-        self.status = "Tool call cancelled.".into();
-        self.history.push(Message::assistant("[tool call cancelled by user]".to_string()));
-        self.scroll_offset = 0;
-    }
-
     /// Resolve a local tool call (no PTY needed) and return its result string.
     fn resolve_local_tool(&self, name: &str) -> String {
         match name {
@@ -448,13 +437,11 @@ impl Tab for LLMTab {
             }) => {
                 let ctrl = modifiers.contains(KeyModifiers::CONTROL);
 
-                // Ctrl+C — copy selection if any, or cancel an active tool call
+                // Ctrl+C — copy selection if any
                 if ctrl && *code == KeyCode::Char('c') {
                     if self.selection.is_some() {
                         self.copy_selection();
                         self.selection = None;
-                    } else if self.is_executing_tool() || self.waiting {
-                        return Action::CancelToolCall;
                     }
                     return Action::None;
                 }

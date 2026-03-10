@@ -1,6 +1,6 @@
 ---
 name: finish-worktree
-description: Commit all changes in the current worktree and open a PR targeting the release branch for the current Cargo.toml version. Usage: /finish-worktree [release-branch] — defaults to release/v<CARGO_VERSION>.
+description: Commit all changes in the current worktree and open a PR targeting the shared release branch. Usage: /finish-worktree [release-branch] — defaults to "release/next".
 argument-hint: "[release-branch]"
 ---
 
@@ -20,13 +20,8 @@ Run these in parallel:
 
 ### 2. Determine the release branch
 
-If the user provided an argument (e.g. `/finish-worktree release/v1.2.0`), use that as the release branch name.
-
-Otherwise read the version from `Cargo.toml`:
-```
-grep '^version' Cargo.toml | head -1 | sed 's/.*= *"\(.*\)"/\1/'
-```
-Use `release/v<version>` (e.g. `release/v0.1.0`) as the release branch name.
+If the user provided an argument (e.g. `/finish-worktree release/v2`), use that as the release branch name.
+Otherwise use `release/next` as the default.
 
 ### 3. Ensure the release branch exists on the remote
 
@@ -68,7 +63,7 @@ EOF
 )"
 ```
 
-If there is nothing to commit (working tree clean), skip to step 6.
+If there is nothing to commit (working tree clean), skip to step 5.
 
 ### 6. Push the current branch to remote
 

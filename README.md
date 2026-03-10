@@ -10,7 +10,7 @@ A terminal UI for managing SSH connections with an embedded LLM assistant.
 
 - **Connection manager** — CRUD SSH connections backed by `~/.ssh/config`; comments above a `Host` block become its description
 - **Embedded terminal** — connects over a PTY so the full SSH session runs inside the TUI; resizes with the window
-- **LLM sidebar** — chat with an AI assistant while connected; Claude automatically reads terminal output via the `read_terminal` tool when you ask about what's on screen
+- **LLM sidebar** — chat with an AI assistant while connected; press `F3` to send the last 50 terminal lines as context
 - **Tool use** — Claude can propose shell commands to run on your remote session; you approve each one before it executes
 - **Multi-provider LLM** — Anthropic (default), OpenAI, or a local Ollama instance
 - **System prompt** — a built-in prompt configures Claude as an SSH/Linux assistant; override it in config
@@ -37,9 +37,7 @@ cargo build --release
 
 ### Release a new version (maintainers)
 
-Merge a `release/v<version>` branch into `main` — the CI workflow tags the commit and publishes the AppImage automatically.
-
-Alternatively, push a tag directly:
+Tag a commit — the CI workflow builds and publishes the AppImage automatically:
 
 ```bash
 git tag v1.0.0
@@ -78,6 +76,7 @@ ollama_model = "llama3"
 | `a / e / d` | Listing | Add / Edit / Delete |
 | `/` | Listing | Filter |
 | `F2` | Connected | Switch panel (terminal ↔ LLM) |
+| `F3` | Connected | Send last 50 terminal lines to LLM |
 | `ctrl+d` | Terminal | Disconnect |
 | `ctrl+up / down` | Terminal or LLM | Scroll history |
 | `enter` | LLM | Send message |

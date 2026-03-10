@@ -30,14 +30,12 @@ use tabs::{Tab, listing::ListingTab, llm::LLMTab, terminal::TerminalTab};
 use ui::{keybindings::render_keybindings, theme::Theme};
 
 /// Captures terminal output produced by a tool-call command and forwards it
-/// to the LLM once the output has been stable (no new lines) for a short period.
+/// to the LLM once the deadline elapses.
 struct PendingCapture {
     /// Number of terminal lines present *before* the command was sent.
     snapshot: usize,
-    /// Line count at the last tick where output was still growing.
-    last_line_count: usize,
-    /// When the line count last changed (used to detect output stability).
-    last_change: std::time::Instant,
+    /// When to stop waiting and send whatever has been captured so far.
+    deadline: std::time::Instant,
 }
 
 struct Sheesh {
@@ -94,11 +92,7 @@ impl Sheesh {
         let provider = build_provider(&self.llm_config);
         let output_log = terminal.output_log_arc();
         self.terminal = Some(terminal);
-        let mut llm = LLMTab::new(
-            provider,
-            self.llm_config.system_prompt.clone(),
-            conn.clone(),
-        );
+        let mut llm = LLMTab::new(provider, self.llm_config.system_prompt.clone(), conn.clone());
         llm.set_terminal_output(output_log);
         self.llm = Some(llm);
         self.state = AppState::Connected {
@@ -199,28 +193,17 @@ impl Sheesh {
                 match action {
                     Action::Quit => return false,
                     Action::Disconnect => self.disconnect(),
-                    Action::CancelToolCall => {
-                        self.pending_capture = None;
-                        if let Some(llm) = &mut self.llm {
-                            llm.cancel_tool_call();
-                        }
-                        if let Some(terminal) = &mut self.terminal {
-                            terminal.set_tool_locked(false);
-                        }
-                    }
                     Action::SendToTerminal(cmd) => {
                         if let Some(t) = &mut self.terminal {
                             let snapshot = t.line_count();
                             t.send_string(&cmd);
                             t.send_string("\r");
                             t.set_tool_locked(true);
-                            // Wait for output to stabilise (300 ms of silence) then
-                            // forward it to Claude. The user can press ctrl+c to cancel.
-                            let now = std::time::Instant::now();
+                            // Capture output for 1.5 s then forward it to Claude.
                             self.pending_capture = Some(PendingCapture {
                                 snapshot,
-                                last_line_count: snapshot,
-                                last_change: now,
+                                deadline: std::time::Instant::now()
+                                    + std::time::Duration::from_millis(1500),
                             });
                         }
                         if let AppState::Connected { ref mut focus, .. } = self.state {
@@ -306,9 +289,11 @@ impl Sheesh {
                         .as_ref()
                         .map(|t| t.key_hints())
                         .unwrap_or_default(),
-                    ConnectedFocus::LLM => {
-                        self.llm.as_ref().map(|l| l.key_hints()).unwrap_or_default()
-                    }
+                    ConnectedFocus::LLM => self
+                        .llm
+                        .as_ref()
+                        .map(|l| l.key_hints())
+                        .unwrap_or_default(),
                 };
                 hints.extend(panel_hints);
                 hints.push(("ctrl+q", "quit"));
@@ -381,26 +366,12 @@ fn main() -> anyhow::Result<()> {
             loop {
                 terminal.draw(|f| app.draw(f))?;
 
-                // Forward captured terminal output to Claude once output has been
-                // stable (no new PTY lines) for 300 ms.
-                let should_fire = if let Some(ref mut cap) = app.pending_capture {
-                    let now = std::time::Instant::now();
-                    let current = app.terminal.as_ref().map_or(0, |t| t.line_count());
-                    if current > cap.last_line_count {
-                        cap.last_line_count = current;
-                        cap.last_change = now;
-                    }
-                    let silence = now.duration_since(cap.last_change);
-                    let has_output = cap.last_line_count > cap.snapshot;
-                    // Wait for output to appear, then stabilise for 300 ms.
-                    // If the command produces no output at all, fire after 5 s.
-                    (has_output && silence >= Duration::from_millis(300))
-                        || (!has_output && silence >= Duration::from_secs(5))
-                } else {
-                    false
-                };
-                if should_fire {
-                    let snapshot = app.pending_capture.take().unwrap().snapshot;
+                // Forward captured terminal output to Claude once the deadline elapses.
+                if let Some(ref cap) = app.pending_capture
+                    && std::time::Instant::now() >= cap.deadline
+                {
+                    let snapshot = cap.snapshot;
+                    app.pending_capture = None;
                     if let (Some(terminal), Some(llm)) = (&app.terminal, &mut app.llm)
                         && llm.awaiting_output_id.is_some()
                     {
@@ -411,9 +382,7 @@ fn main() -> anyhow::Result<()> {
 
                 // Release the tool lock once the LLM finishes the tool-execution cycle.
                 if let (Some(terminal), Some(llm)) = (&mut app.terminal, &app.llm)
-                    && terminal.tool_locked
-                    && !llm.is_executing_tool()
-                    && !llm.waiting
+                    && terminal.tool_locked && !llm.is_executing_tool() && !llm.waiting
                 {
                     terminal.set_tool_locked(false);
                 }
@@ -444,10 +413,7 @@ fn load_llm_config() -> LLMConfig {
 
     match std::fs::read_to_string(&path) {
         Err(e) => {
-            log::warn!(
-                "[config] could not read config file: {} — using defaults",
-                e
-            );
+            log::warn!("[config] could not read config file: {} — using defaults", e);
         }
         Ok(content) => {
             #[derive(serde::Deserialize, Default)]
@@ -457,17 +423,10 @@ fn load_llm_config() -> LLMConfig {
             }
             match toml::from_str::<ConfigFile>(&content) {
                 Err(e) => {
-                    log::error!(
-                        "[config] failed to parse config.toml: {} — using defaults",
-                        e
-                    );
+                    log::error!("[config] failed to parse config.toml: {} — using defaults", e);
                 }
                 Ok(cfg) => {
-                    log::info!(
-                        "[config] loaded: provider={} model={}",
-                        cfg.llm.provider,
-                        cfg.llm.model
-                    );
+                    log::info!("[config] loaded: provider={} model={}", cfg.llm.provider, cfg.llm.model);
                     return cfg.llm;
                 }
             }

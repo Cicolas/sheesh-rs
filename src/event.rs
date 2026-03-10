@@ -9,8 +9,6 @@ pub enum Action {
     Disconnect,
     /// Send a command string to the terminal PTY (no trailing newline).
     SendToTerminal(String),
-    /// Cancel an in-progress tool call and return to the user prompt.
-    CancelToolCall,
     /// No-op
     None,
 }
