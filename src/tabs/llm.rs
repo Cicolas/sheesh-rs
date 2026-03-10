@@ -249,8 +249,12 @@ impl LLMTab {
     /// Cancel any in-progress tool call and return to an idle state so the
     /// user can type a new message.
     pub fn cancel_tool_call(&mut self) {
+        // If the tool call was already confirmed (assistant blocks pushed to rich_history),
+        // we must add a tool_result to avoid sending an orphaned tool_use to the API.
+        if let Some(id) = self.awaiting_output_id.take() {
+            self.rich_history.push(RichMessage::tool_result(&id, "User cancelled the command before output was captured."));
+        }
         self.pending_tool_call = None;
-        self.awaiting_output_id = None;
         self.waiting = false;
         self.status = "Tool call cancelled.".into();
         self.history.push(Message::assistant("[tool call cancelled by user]".to_string()));

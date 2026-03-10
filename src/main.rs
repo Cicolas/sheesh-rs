@@ -392,9 +392,9 @@ fn main() -> anyhow::Result<()> {
                     }
                     let silence = now.duration_since(cap.last_change);
                     let has_output = cap.last_line_count > cap.snapshot;
-                    // Wait for output to appear, then stabilise for 300 ms.
+                    // Wait for output to appear, then stabilise for 1100 ms.
                     // If the command produces no output at all, fire after 5 s.
-                    (has_output && silence >= Duration::from_millis(300))
+                    (has_output && silence >= Duration::from_millis(1100))
                         || (!has_output && silence >= Duration::from_secs(5))
                 } else {
                     false
