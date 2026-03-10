@@ -2214,7 +2214,7 @@ dependencies = [
 
 [[package]]
 name = "sheesh-rs"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "ansi_term",
  "anyhow",
@@ -2229,8 +2229,18 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sheesh-tools",
  "termwiz",
  "toml",
+]
+
+[[package]]
+name = "sheesh-tools"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "log",
+ "serde_json",
 ]
 
 [[package]]

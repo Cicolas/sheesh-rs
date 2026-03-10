@@ -1,6 +1,10 @@
+[workspace]
+members = [".", "crates/sheesh-tools"]
+resolver = "2"
+
 [package]
 name = "sheesh-rs"
-version = "1.0.4"
+version = "1.0.5"
 edition = "2024"
 
 [dependencies]
@@ -20,3 +24,5 @@ reqwest = { version = "0.12", features = ["blocking", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+
+sheesh-tools = { path = "crates/sheesh-tools" }

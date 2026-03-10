@@ -5,6 +5,7 @@ use log::{debug, error, warn};
 use serde_json::{json, Value};
 
 use super::{ContentBlock, LLMEvent, LLMProvider, Message, RichMessage, Role};
+use sheesh_tools::{ToolResult, all_tools, dispatch};
 
 const RETRY_DELAYS: &[Duration] = &[
     Duration::from_millis(500),
@@ -78,84 +79,6 @@ impl AnthropicProvider {
 
         Err(last_err)
     }
-}
-
-/// All tool definitions sent to Claude on every rich request.
-fn all_tools() -> Value {
-    json!([
-        {
-            "name": "run_command",
-            "description": "Execute an arbitrary shell command on the user's remote SSH session. \
-                             The user will be shown the command and must approve before it runs.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "command": { "type": "string", "description": "The exact shell command to execute." },
-                    "description": { "type": "string", "description": "One-sentence plain-English explanation of what this command does." }
-                },
-                "required": ["command"]
-            }
-        },
-        {
-            "name": "system_information",
-            "description": "Return the SSH connection settings for the current session (host, user, port, description, identity file, extra options). No PTY interaction needed.",
-            "input_schema": { "type": "object", "properties": {}, "required": [] }
-        },
-        {
-            "name": "make_dir",
-            "description": "Create a directory (and any missing parents) on the remote host using mkdir -p.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Absolute or relative path of the directory to create." }
-                },
-                "required": ["path"]
-            }
-        },
-        {
-            "name": "touch_file",
-            "description": "Create an empty file (or update its timestamp) on the remote host using touch.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "file": { "type": "string", "description": "Path of the file to create or touch." }
-                },
-                "required": ["file"]
-            }
-        },
-        {
-            "name": "read_file",
-            "description": "Read and return the contents of a file on the remote host using cat.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "file": { "type": "string", "description": "Path of the file to read." }
-                },
-                "required": ["file"]
-            }
-        },
-        {
-            "name": "list_dir",
-            "description": "List the contents of a directory on the remote host using ls -la.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Directory path to list. Defaults to current directory." }
-                },
-                "required": []
-            }
-        },
-        {
-            "name": "read_terminal",
-            "description": "Read the recent output from the user's terminal. Returns the last lines of captured terminal output. Use this to understand what is currently happening in the SSH session.",
-            "input_schema": { "type": "object", "properties": {}, "required": [] }
-        }
-    ])
-}
-
-/// Wrap a path/filename in single quotes, escaping any embedded single quotes.
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// Convert a `RichMessage` to the JSON format Anthropic expects.
@@ -320,53 +243,11 @@ impl LLMProvider for AnthropicProvider {
                 }
             }
 
-            // Dispatch by tool name.
-            match name.as_str() {
-                "system_information" | "read_terminal" => {
-                    debug!("[Anthropic] local tool: {}", name);
-                    return Ok(LLMEvent::LocalTool { id, name, assistant_blocks });
-                }
-                "run_command" => {
-                    let command = input["command"]
-                        .as_str()
-                        .ok_or_else(|| anyhow::anyhow!("run_command missing 'command' field"))?
-                        .to_string();
-                    let description = input["description"].as_str().map(|s| s.to_string());
-                    debug!("[Anthropic] tool_call: run_command command={:?}", command);
-                    return Ok(LLMEvent::ToolCall { id, command, description, assistant_blocks });
-                }
-                "make_dir" => {
-                    let path = input["path"].as_str().unwrap_or(".");
-                    let command = format!("mkdir -p {}", shell_quote(path));
-                    let description = Some(format!("Create directory {}", path));
-                    debug!("[Anthropic] tool_call: make_dir path={:?}", path);
-                    return Ok(LLMEvent::ToolCall { id, command, description, assistant_blocks });
-                }
-                "touch_file" => {
-                    let file = input["file"].as_str().unwrap_or("");
-                    let command = format!("touch {}", shell_quote(file));
-                    let description = Some(format!("Create/touch file {}", file));
-                    debug!("[Anthropic] tool_call: touch_file file={:?}", file);
-                    return Ok(LLMEvent::ToolCall { id, command, description, assistant_blocks });
-                }
-                "read_file" => {
-                    let file = input["file"].as_str().unwrap_or("");
-                    let command = format!("cat {}", shell_quote(file));
-                    let description = Some(format!("Read file {}", file));
-                    debug!("[Anthropic] tool_call: read_file file={:?}", file);
-                    return Ok(LLMEvent::ToolCall { id, command, description, assistant_blocks });
-                }
-                "list_dir" => {
-                    let path = input["path"].as_str().unwrap_or(".");
-                    let command = format!("ls -la {}", shell_quote(path));
-                    let description = Some(format!("List directory {}", path));
-                    debug!("[Anthropic] tool_call: list_dir path={:?}", path);
-                    return Ok(LLMEvent::ToolCall { id, command, description, assistant_blocks });
-                }
-                other => {
-                    return Err(anyhow::anyhow!("unknown tool: {}", other));
-                }
-            }
+            // Dispatch by tool name via shared sheesh-tools crate.
+            return match dispatch(id, name, &input)? {
+                ToolResult::Local { id, name } => Ok(LLMEvent::LocalTool { id, name, assistant_blocks }),
+                ToolResult::Command { id, command, description } => Ok(LLMEvent::ToolCall { id, command, description, assistant_blocks }),
+            };
         }
 
         // Normal text response.
