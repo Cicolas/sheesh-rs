@@ -1,3 +1,4 @@
 target/
 .env
-logs.claude/worktrees/
+logs
+.claude/worktrees/
