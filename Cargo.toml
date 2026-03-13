@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "sheesh-rs"
-version = "1.0.6"
+version = "1.0.7"
 edition = "2024"
 
 [dependencies]
@@ -16,6 +16,7 @@ ratatui = "0.30.0"
 ratatui-widgets = "0.3.0"
 
 anyhow = "1"
+clap = { version = "4", features = ["derive"] }
 arboard = "3"
 dirs = "5"
 portable-pty = "0.8"

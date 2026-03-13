@@ -2,11 +2,14 @@ mod app;
 mod config;
 mod event;
 mod llm;
+mod logs;
 mod ssh;
 mod tabs;
 mod ui;
 
-use std::{path::Path, time::Duration};
+use std::time::Duration;
+
+use clap::{Parser, Subcommand};
 
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, MouseButton, MouseEventKind, poll, read,
@@ -361,16 +364,116 @@ fn contains(rect: Rect, col: u16, row: u16) -> bool {
     col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
 }
 
-fn main() -> anyhow::Result<()> {
+fn init_logging(logs_config: &logs::LogsConfig) {
+    if logs::is_disabled() {
+        return;
+    }
+    let dir = logs_config.resolved_dir();
+    let log_path = logs::session_log_path(&dir);
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     Ftail::new()
-        .single_file(Path::new("logs"), true, LevelFilter::Debug)
+        .single_file(&log_path, false, LevelFilter::Debug)
         .init()
         .unwrap();
+}
+
+/// sheesh — a TUI SSH connection manager with an embedded LLM assistant.
+#[derive(Parser)]
+#[command(
+    name = "sheesh-rs",
+    version,
+    about = "A TUI app for managing SSH connections with an embedded LLM assistant.",
+    long_about = "\
+sheesh-rs lets you manage SSH connections stored in ~/.ssh/config and connect\n\
+to them through a split-pane TUI. The right panel hosts an LLM chat assistant\n\
+that can receive terminal context and run commands on your behalf.\n\
+\n\
+CONFIGURATION\n\
+  ~/.ssh/config                   SSH connections (source of truth)\n\
+  ~/.config/sheesh/config.toml    App settings (LLM provider, log directory)\n\
+\n\
+CONFIG FILE EXAMPLE\n\
+  [llm]\n\
+  provider    = \"anthropic\"\n\
+  model       = \"claude-sonnet-4-6\"\n\
+  api_key_env = \"ANTHROPIC_API_KEY\"\n\
+\n\
+  [logs]\n\
+  dir = \"/tmp/sheesh\"   # default; use a persistent path to retain logs\n\
+\n\
+TUI KEYBINDINGS\n\
+  Listing view\n\
+    j / k       Navigate connections\n\
+    enter       Connect\n\
+    a           Add connection\n\
+    e           Edit connection\n\
+    d           Delete connection\n\
+    /           Filter connections\n\
+    q           Quit\n\
+\n\
+  Connected view\n\
+    F2          Cycle focus (terminal ↔ LLM chat)\n\
+    F3 / c      Send last 50 terminal lines to LLM\n\
+    ctrl+d      Disconnect\n\
+    enter       Send LLM message (when LLM focused)\n\
+    q           Quit"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Manage session log files
+    Log {
+        #[command(subcommand)]
+        action: LogAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum LogAction {
+    /// Remove all session log files from the log directory
+    Clean,
+    /// Print the most recent session log to stdout
+    View,
+    /// Disable logging for future sessions
+    Disable,
+    /// Re-enable logging
+    Enable,
+}
+
+fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Some(Command::Log { action }) => {
+            match action {
+                LogAction::Clean => {
+                    let cfg = load_app_config();
+                    return logs::cmd_clean(&cfg.logs.resolved_dir());
+                }
+                LogAction::View => {
+                    let cfg = load_app_config();
+                    return logs::cmd_view(&cfg.logs.resolved_dir());
+                }
+                LogAction::Disable => return logs::cmd_disable(),
+                LogAction::Enable => return logs::cmd_enable(),
+            }
+        }
+        None => {}
+    }
+
+    let cfg = load_app_config();
+    init_logging(&cfg.logs);
 
     let ssh_path = ssh_config_path();
     let connections = load_connections(&ssh_path).unwrap_or_default();
 
-    let llm_config = load_llm_config();
+    let llm_config = cfg.llm;
     let mut app = Sheesh::new(connections, llm_config);
 
     // Enable mouse before entering the TUI
@@ -434,13 +537,18 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn load_llm_config() -> LLMConfig {
+struct AppConfig {
+    llm: LLMConfig,
+    logs: logs::LogsConfig,
+}
+
+fn load_app_config() -> AppConfig {
     let path = dirs::config_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("sheesh")
         .join("config.toml");
 
-    log::info!("[config] loading LLM config from {}", path.display());
+    log::info!("[config] loading config from {}", path.display());
 
     match std::fs::read_to_string(&path) {
         Err(e) => {
@@ -454,6 +562,8 @@ fn load_llm_config() -> LLMConfig {
             struct ConfigFile {
                 #[serde(default)]
                 llm: LLMConfig,
+                #[serde(default)]
+                logs: logs::LogsConfig,
             }
             match toml::from_str::<ConfigFile>(&content) {
                 Err(e) => {
@@ -468,11 +578,17 @@ fn load_llm_config() -> LLMConfig {
                         cfg.llm.provider,
                         cfg.llm.model
                     );
-                    return cfg.llm;
+                    return AppConfig {
+                        llm: cfg.llm,
+                        logs: cfg.logs,
+                    };
                 }
             }
         }
     }
 
-    LLMConfig::default()
+    AppConfig {
+        llm: LLMConfig::default(),
+        logs: logs::LogsConfig::default(),
+    }
 }
