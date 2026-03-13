@@ -32,10 +32,17 @@ struct PendingToolCall {
     assistant_blocks: Vec<ContentBlock>,
 }
 
+/// Maximum number of non-system messages kept in the sliding window sent to the API.
+const MAX_HISTORY_MESSAGES: usize = 20;
+/// Maximum characters kept per content block when windowing (prevents giant tool results from blowing the context).
+const MAX_BLOCK_CHARS: usize = 4000;
+
 pub struct LLMTab {
     pub history: Vec<Message>,
     /// Full API message history including tool calls/results (sent to the API).
     rich_history: Vec<RichMessage>,
+    /// System message preserved across /clear and windowing.
+    system_message: Option<RichMessage>,
     pub input: String,
     pub waiting: bool,
     pub status: String,
@@ -72,10 +79,8 @@ pub struct LLMTab {
 impl LLMTab {
     pub fn new(provider: Arc<dyn LLMProvider>, system_prompt: Option<String>, connection: SSHConnection) -> Self {
         let (tx, rx) = mpsc::channel();
-        let mut rich_history = vec![];
-        if let Some(prompt) = system_prompt {
-            rich_history.push(RichMessage::system(prompt));
-        }
+        let system_message = system_prompt.map(RichMessage::system);
+        let rich_history: Vec<RichMessage> = system_message.iter().cloned().collect();
 
         Self {
             history: vec![],
@@ -100,8 +105,53 @@ impl LLMTab {
             connection,
             last_visual_row_map: vec![],
             terminal_output: None,
+            system_message,
             rich_history,
         }
+    }
+
+    /// Returns the history slice to send to the API, capped to MAX_HISTORY_MESSAGES
+    /// non-system messages (always prepending the system message if present).
+    /// Large content blocks are truncated to MAX_BLOCK_CHARS to avoid token limit errors.
+    fn windowed_history(&self) -> Vec<RichMessage> {
+        let non_system: Vec<&RichMessage> = self.rich_history
+            .iter()
+            .filter(|m| m.role != Role::System)
+            .collect();
+        let start = non_system.len().saturating_sub(MAX_HISTORY_MESSAGES);
+        let mut window: Vec<RichMessage> = self.system_message.iter().cloned().collect();
+        window.extend(non_system[start..].iter().map(|m| {
+            let content = m.content.iter().map(|block| match block {
+                ContentBlock::Text { text } if text.len() > MAX_BLOCK_CHARS => {
+                    ContentBlock::Text { text: text[..MAX_BLOCK_CHARS].to_string() + "\n[truncated]" }
+                }
+                ContentBlock::ToolResult { tool_use_id, content } if content.len() > MAX_BLOCK_CHARS => {
+                    ContentBlock::ToolResult {
+                        tool_use_id: tool_use_id.clone(),
+                        content: content[..MAX_BLOCK_CHARS].to_string() + "\n[truncated]",
+                    }
+                }
+                other => other.clone(),
+            }).collect();
+            RichMessage { role: m.role.clone(), content }
+        }));
+        let total_chars: usize = window.iter().flat_map(|m| m.content.iter()).map(|b| match b {
+            ContentBlock::Text { text } => text.len(),
+            ContentBlock::ToolResult { content, .. } => content.len(),
+            ContentBlock::ToolUse { name, input, .. } => name.len() + input.to_string().len(),
+        }).sum();
+        log::debug!("[llm] sending {} messages ({} chars ~{} tokens) to API", window.len(), total_chars, total_chars / 4);
+        window
+    }
+
+    /// Clear the conversation history, keeping the system prompt.
+    fn clear_history(&mut self) {
+        self.history.clear();
+        self.rich_history = self.system_message.iter().cloned().collect();
+        self.suggestions.clear();
+        self.suggestion_idx = None;
+        self.scroll_offset = 0;
+        self.status = "History cleared.".into();
     }
 
     pub fn set_terminal_output(&mut self, output: Arc<Mutex<Vec<String>>>) {
@@ -192,7 +242,7 @@ impl LLMTab {
                     self.rich_history.push(RichMessage::tool_result(&local_id, &result));
                     self.waiting = true;
                     self.status = format!("{}… waiting for Claude…", name);
-                    spawn_completion_rich(Arc::clone(&self.provider), self.rich_history.clone(), self.tx.clone());
+                    spawn_completion_rich(Arc::clone(&self.provider), self.windowed_history(), self.tx.clone());
                     self.scroll_offset = 0;
                 }
                 LLMEvent::Error(err) => {
@@ -232,7 +282,7 @@ impl LLMTab {
             self.status = "Declined — waiting for Claude…".into();
             spawn_completion_rich(
                 Arc::clone(&self.provider),
-                self.rich_history.clone(),
+                self.windowed_history(),
                 self.tx.clone(),
             );
             None
@@ -311,13 +361,17 @@ impl LLMTab {
         self.status = "Output captured — waiting for Claude…".into();
         spawn_completion_rich(
             Arc::clone(&self.provider),
-            self.rich_history.clone(),
+            self.windowed_history(),
             self.tx.clone(),
         );
     }
 
     pub fn send_message(&mut self, content: String) {
         if content.trim().is_empty() || self.waiting {
+            return;
+        }
+        if content.trim() == "/clear" {
+            self.clear_history();
             return;
         }
         self.history.push(Message::user(&content));
@@ -327,7 +381,7 @@ impl LLMTab {
         self.status = "Waiting for response…".into();
         spawn_completion_rich(
             Arc::clone(&self.provider),
-            self.rich_history.clone(),
+            self.windowed_history(),
             self.tx.clone(),
         );
     }
