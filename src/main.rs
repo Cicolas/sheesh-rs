@@ -2,18 +2,17 @@ mod app;
 mod config;
 mod event;
 mod llm;
+mod logging;
 mod ssh;
 mod tabs;
 mod ui;
 
-use std::{path::Path, time::Duration};
+use std::time::Duration;
 
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, MouseButton, MouseEventKind, poll, read,
 };
 use crossterm::execute;
-use ftail::Ftail;
-use log::LevelFilter;
 use ratatui::{
     Frame, Terminal,
     layout::{Constraint, Layout, Rect},
@@ -26,6 +25,9 @@ use app::{AppState, ConnectedFocus};
 use config::{load_connections, save_connections, ssh_config_path};
 use event::Action;
 use llm::{LLMConfig, build_provider};
+use logging::{
+    Command, handle_log_command, init_logging, load_log_config, parse_command, sheesh_config_path,
+};
 use tabs::{Tab, listing::ListingTab, llm::LLMTab, terminal::TerminalTab};
 use ui::{keybindings::render_keybindings, theme::Theme};
 
@@ -362,10 +364,14 @@ fn contains(rect: Rect, col: u16, row: u16) -> bool {
 }
 
 fn main() -> anyhow::Result<()> {
-    Ftail::new()
-        .single_file(Path::new("logs"), true, LevelFilter::Debug)
-        .init()
-        .unwrap();
+    let command = parse_command()?;
+    let log_config = load_log_config();
+
+    if let Some(Command::Log { command }) = command {
+        return handle_log_command(command, &log_config);
+    }
+
+    init_logging(&log_config)?;
 
     let ssh_path = ssh_config_path();
     let connections = load_connections(&ssh_path).unwrap_or_default();
@@ -435,10 +441,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn load_llm_config() -> LLMConfig {
-    let path = dirs::config_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("sheesh")
-        .join("config.toml");
+    let path = sheesh_config_path();
 
     log::info!("[config] loading LLM config from {}", path.display());
 
@@ -476,3 +479,4 @@ fn load_llm_config() -> LLMConfig {
 
     LLMConfig::default()
 }
+
