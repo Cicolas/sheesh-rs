@@ -16,6 +16,7 @@ A terminal UI for managing SSH connections with an embedded LLM assistant.
 - **System prompt** — a built-in prompt configures Claude as an SSH/Linux assistant; override it in config
 - **Code suggestions** — code blocks in Claude's replies are selectable with `Tab` and sendable to the terminal with `F4`
 - **Mouse support** — click to focus panels, drag to select text, scroll wheel to scroll history
+- **Session logs** — debug logs are written per run to `~/.config/sheesh/logs/`, with CLI helpers to view, clean, disable, or re-enable them
 
 ## Installation
 
@@ -65,9 +66,26 @@ system_prompt = "..."           # optional — overrides the built-in assistant 
 # Ollama only
 ollama_host = "http://localhost:11434"
 ollama_model = "llama3"
+
+[logs]
+# Optional. Defaults to true unless disabled with `sheesh-rs log disable`.
+enabled = true
+# Optional. Defaults to ~/.config/sheesh/logs.
+dir = "/path/to/sheesh/logs"
 ```
 
 `api_key` takes precedence over `api_key_env`. If neither is set the key is empty and the provider will return an auth error.
+
+## Logs
+
+Each TUI session writes a separate `session-<unix timestamp>.log` file under `~/.config/sheesh/logs/` by default. Use the built-in helpers to inspect or manage them:
+
+```bash
+sheesh-rs log view      # print the newest session log
+sheesh-rs log clean     # delete session log files
+sheesh-rs log disable   # create a marker file that disables session logging
+sheesh-rs log enable    # remove the marker file and re-enable session logging
+```
 
 ## Keybindings
 
